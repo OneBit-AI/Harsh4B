@@ -1,7 +1,12 @@
 # Virtual Environment
 .venv/
+.venv-mlx
+.venv-mlx/
 env/
 venv/
+
+# MLX kill-switch latch
+MLX/STOP
 
 # Model Weights and Large Checkpoints (>100MB)
 *.pt
@@ -19,3 +24,9 @@ __pycache__/
 # OS Specific
 .DS_Store
 Thumbs.db
+
+# Run logs / bench outputs (never commit)
+MLX/runs/
+runs/
+**/runs/
+*.jsonl
