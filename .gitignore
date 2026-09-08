@@ -1,0 +1,21 @@
+# Virtual Environment
+.venv/
+env/
+venv/
+
+# Model Weights and Large Checkpoints (>100MB)
+*.pt
+*.lat.pt
+*.bin
+*.safetensors
+*.pth
+
+# Python Cache & Logs
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# OS Specific
+.DS_Store
+Thumbs.db

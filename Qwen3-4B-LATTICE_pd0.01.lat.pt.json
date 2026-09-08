@@ -1,0 +1,15 @@
+{
+  "encoding": "maskid2 + T0 2bit + T1 2bit(compacted) + fp16 mu/a0/a1",
+  "src": "C:\\Users\\OneBit AI\\Desktop\\onebit ai\\Poojith\\1-ptq\\ternary-v2\\save_models\\Qwen3-4B-LATTICE_pd0.01",
+  "n_linears": 252,
+  "max_abs_err": 0.0003509521484375,
+  "lat_bytes": 2615665536,
+  "fp16_linear_bytes": 7266631680,
+  "other_bytes": 3192265744,
+  "rmse": 6.626858834179825e-06,
+  "mean_abs_w": 0.01782674334975548,
+  "rel_rmse": 0.00037173692940784507,
+  "bits_per_weight": 5.759291294642857,
+  "linear_compression": 2.778119595180536,
+  "elapsed_sec": 49.8
+}
