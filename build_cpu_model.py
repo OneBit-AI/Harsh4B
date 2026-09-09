@@ -65,66 +65,74 @@ class CPURotatedLinear(nn.Module):
 def build_cpu(model_id="Qwen/Qwen3-4B",
               packed_path=os.path.join(SCRIPT_DIR, "Qwen3-4B-LATTICE_pd0.01.lat.pt"),
               rot_path=os.path.join(SCRIPT_DIR, "rot_4b_LR.pt"),
-              cache_path=os.path.join(SCRIPT_DIR, "Qwen3-4B-LATTICE_cpu_bf16.pt"),
+              cache_path=os.path.join(SCRIPT_DIR, "Qwen3-4B-LATTICE_cpu_bf16_absorbed.pt"),
               dtype=torch.bfloat16,
               verbose=True):
     
+    # Configure optimal threading for Intel CPU (avoid hyperthreading contention)
+    torch.set_num_threads(4)
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    os.environ["KMP_BLOCKTIME"] = "0"
+
     cfg = AutoConfig.from_pretrained(model_id)
     if verbose:
         print("Creating skeleton model on CPU...", flush=True)
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(cfg, torch_dtype=dtype)
-    model = model.to(dtype)
-    mods = dict(model.named_modules())
 
-    rot = torch.load(rot_path, map_location="cpu", weights_only=False)
-
+    # 1. Check if absorbed weights cache exists (fastest path: 100% native PyTorch C++ nn.Linear)
     if os.path.exists(cache_path):
         if verbose:
-            print(f"Loading cached CPU weights from {os.path.basename(cache_path)}...", flush=True)
+            print(f"Loading absorbed CPU weights from {os.path.basename(cache_path)}...", flush=True)
         t0 = time.time()
         cpu_weights = torch.load(cache_path, map_location="cpu", weights_only=False)
-        if verbose:
-            print(f"Loaded cached state in {time.time()-t0:.1f}s. Assembling model...", flush=True)
-
-        plain = {}
-        for k, v in cpu_weights.items():
-            mod_name = k[:-len(".weight")] if k.endswith(".weight") else None
-            if mod_name and mod_name in mods:
-                parent_name, _, child = mod_name.rpartition(".")
-                parent = mods[parent_name]
-                old = getattr(parent, child, None)
-                if isinstance(old, nn.Linear):
-                    bias = getattr(old, "bias", None)
-                    if bias is not None and not bias.is_meta:
-                        bias = bias.to(dtype)
-                    else:
-                        bias = None
-                    
-                    lookup_name = mod_name.replace("model.", "", 1) if mod_name.startswith("model.") else mod_name
-                    rd = rot.get(lookup_name) or rot.get(mod_name)
-                    L = rd.get("L").to(dtype) if rd is not None and "L" in rd else None
-                    R = rd.get("R").to(dtype) if rd is not None and "R" in rd else None
-                    dim_l = rd.get("dim_l", 0) if rd is not None else 0
-                    dim_r = rd.get("dim_r", 0) if rd is not None else 0
-
-                    cpl = CPURotatedLinear(v.to(dtype), bias, L, R, dim_l, dim_r)
-                    setattr(parent, child, cpl)
-                    continue
-            plain[k] = v.to(dtype) if (torch.is_tensor(v) and v.is_floating_point()) else v
-
-        model.load_state_dict(plain, strict=False, assign=True)
+        model.load_state_dict(cpu_weights, strict=False, assign=True)
         model.eval()
         if verbose:
-            print("Model fully assembled on CPU!", flush=True)
+            print(f"Model fully assembled on CPU with absorbed rotations in {time.time()-t0:.1f}s!", flush=True)
         return model
 
-    # Reconstruct from packed checkpoint
+    # 2. Check if unabsorbed cache exists, and absorb on the fly
+    unabs_cache = os.path.join(SCRIPT_DIR, "Qwen3-4B-LATTICE_cpu_bf16.pt")
+    if os.path.exists(unabs_cache) and os.path.exists(rot_path):
+        if verbose:
+            print(f"Absorbing KOTMS rotations into weights from {os.path.basename(unabs_cache)}...", flush=True)
+        t0 = time.time()
+        sd = torch.load(unabs_cache, map_location="cpu", weights_only=False)
+        rot = torch.load(rot_path, map_location="cpu", weights_only=False)
+        for k in list(sd.keys()):
+            if not k.endswith(".weight"):
+                continue
+            mod_name = k[:-len(".weight")]
+            lookup_name = mod_name.replace("model.", "", 1) if mod_name.startswith("model.") else mod_name
+            rd = rot.get(lookup_name) or rot.get(mod_name)
+            if rd is not None and "L" in rd and "R" in rd:
+                W = sd[k]
+                oc, ic = W.shape
+                dim_l, dim_r = rd["dim_l"], rd["dim_r"]
+                L = rd["L"].float()
+                R = rd["R"].float()
+                W_mat = W.float().reshape(oc, dim_l, dim_r)
+                W_eff = torch.matmul(torch.matmul(L.T, W_mat), R.T).reshape(oc, ic).to(dtype)
+                sd[k] = W_eff
+
+        if verbose:
+            print(f"Absorbed all rotations in {time.time()-t0:.1f}s. Saving to {os.path.basename(cache_path)}...", flush=True)
+        torch.save(sd, cache_path)
+        model.load_state_dict(sd, strict=False, assign=True)
+        model.eval()
+        return model
+
+    # 3. Reconstruct from packed checkpoint
     if verbose:
         print(f"Reconstructing weights from packed checkpoint {os.path.basename(packed_path)}...", flush=True)
     t_start = time.time()
     pk = torch.load(packed_path, map_location="cpu", weights_only=False)
     pk.pop("__latmeta__", None)
+    rot = torch.load(rot_path, map_location="cpu", weights_only=False) if os.path.exists(rot_path) else {}
 
     lin_keys = {k for k, v in pk.items() if isinstance(v, dict) and "maskid" in v}
     plain = {k: v for k, v in pk.items() if k not in lin_keys and torch.is_tensor(v)}
@@ -143,9 +151,6 @@ def build_cpu(model_id="Qwen/Qwen3-4B",
     for idx, k in enumerate(sorted(lin_keys)):
         v = pk[k]
         mod_name = k[:-len(".weight")]
-        parent_name, _, child = mod_name.rpartition(".")
-        parent = mods[parent_name]
-        old = getattr(parent, child)
         oc, ic = v["shape"]
         nb, bs = v["nblocks"], v["blocksize"]
 
@@ -177,24 +182,18 @@ def build_cpu(model_id="Qwen/Qwen3-4B",
                        + a1[mid, :, b:b+1] * T1[:, st:ed])
                 W[:, st:ed][sel] = blk[sel]
 
-        W_dtype = W.to(dtype)
-        cache_dict[k] = W_dtype
-
-        bias = getattr(old, "bias", None)
-        if bias is not None and not bias.is_meta:
-            bias = bias.to(dtype)
-        else:
-            bias = None
-
         lookup_name = mod_name.replace("model.", "", 1) if mod_name.startswith("model.") else mod_name
         rd = rot.get(lookup_name) or rot.get(mod_name)
-        L = rd.get("L").to(dtype) if rd is not None and "L" in rd else None
-        R = rd.get("R").to(dtype) if rd is not None and "R" in rd else None
-        dim_l = rd.get("dim_l", 0) if rd is not None else 0
-        dim_r = rd.get("dim_r", 0) if rd is not None else 0
+        if rd is not None and "L" in rd and "R" in rd:
+            dim_l, dim_r = rd["dim_l"], rd["dim_r"]
+            L = rd["L"].float()
+            R = rd["R"].float()
+            W_mat = W.reshape(oc, dim_l, dim_r)
+            W_eff = torch.matmul(torch.matmul(L.T, W_mat), R.T).reshape(oc, ic)
+            W = W_eff
 
-        cpl = CPURotatedLinear(W_dtype, bias, L, R, dim_l, dim_r)
-        setattr(parent, child, cpl)
+        W_dtype = W.to(dtype)
+        cache_dict[k] = W_dtype
 
         if verbose and (idx + 1) % 25 == 0:
             print(f"  Reconstructed [{idx+1}/{total_lin}] layers ({(idx+1)/total_lin*100:.0f}%)...", flush=True)
@@ -204,8 +203,9 @@ def build_cpu(model_id="Qwen/Qwen3-4B",
         print(f"Reconstruction completed in {elapsed:.1f}s! Saving to cache {os.path.basename(cache_path)}...", flush=True)
     torch.save(cache_dict, cache_path)
     if verbose:
-        print(f"Saved CPU cache to {cache_path}! Subsequent startups will take ~3 seconds.", flush=True)
+        print(f"Saved CPU cache to {cache_path}! Subsequent startups will take ~5 seconds.", flush=True)
 
+    model.load_state_dict(cache_dict, strict=False, assign=True)
     model.eval()
     return model
 

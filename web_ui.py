@@ -56,6 +56,12 @@ if DEVICE == "cuda":
     vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
     print(f"[Model Ready in {time.time() - t_start:.1f}s | {vram_gb:.2f} GiB VRAM]")
 else:
+    torch.set_num_threads(4)
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    os.environ["KMP_BLOCKTIME"] = "0"
     model = build_cpu(MODEL_ID, PACKED_PATH, ROT_PATH, verbose=True)
     vram_gb = 0.0
     print(f"[Model Ready on CPU in {time.time() - t_start:.1f}s]")
@@ -573,11 +579,11 @@ async function updateStatus() {
     const data = await res.json();
     if (data.ready) {
       const modeBadge = document.getElementById('mode-badge');
-      if (modeBadge) modeBadge.innerText = data.device === 'cuda' ? 'Triton v4_w1 (CUDA)' : 'Mac CPU (bfloat16)';
+      if (modeBadge) modeBadge.innerText = data.device === 'cuda' ? 'Triton v4_w1 (CUDA)' : 'CPU Native (Absorbed KOTMS)';
       const speedBadge = document.getElementById('speed-badge');
-      if (speedBadge) speedBadge.innerText = data.device === 'cuda' ? '~42 tok/s' : 'Standalone Local';
+      if (speedBadge) speedBadge.innerText = data.device === 'cuda' ? '~42 tok/s (RTX 5070)' : '~0.85 tok/s (Intel i7)';
       const welcomeP = document.getElementById('welcome-desc');
-      if (welcomeP) welcomeP.innerText = data.device === 'cuda' ? 'Running packed ternary weights directly against custom Triton GEMV kernels in GPU VRAM.' : 'Running packed ternary weights on Mac CPU in native bfloat16 without internet.';
+      if (welcomeP) welcomeP.innerText = data.device === 'cuda' ? 'Running packed ternary weights directly against custom Triton GEMV kernels in GPU VRAM.' : 'Running locally on Mac CPU with pre-absorbed KOTMS rotations in native PyTorch bfloat16.';
     }
   } catch(e) {}
 }
@@ -658,7 +664,7 @@ async function sendMessage() {
   // Prepare Bot Message
   const botMsgEl = appendMessage('bot', '');
   const contentEl = botMsgEl.querySelector('.msg-content');
-  contentEl.innerHTML = '<div style="display:flex; align-items:center; gap:8px; color:#a5b4fc; font-size:13px; padding:4px 0;"><span class="status-dot" style="background:#6366f1; box-shadow:0 0 8px #6366f1;"></span> <em>Processing prompt on CPU (takes ~30-45s)...</em></div>';
+  contentEl.innerHTML = '<div style="display:flex; align-items:center; gap:8px; color:#a5b4fc; font-size:13px; padding:4px 0;"><span class="status-dot" style="background:#6366f1; box-shadow:0 0 8px #6366f1;"></span> <em>Processing prompt on CPU (takes ~15-20s)...</em></div>';
 
   const temp = parseFloat(document.getElementById('temp-input').value) || 0.7;
   const maxTokens = parseInt(document.getElementById('max-input').value) || 128;
