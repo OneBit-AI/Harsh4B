@@ -21,32 +21,49 @@ sys.path.insert(0, SCRIPT_DIR)
 sys.path.insert(0, PARENT_DIR)
 
 import torch
-from build_packed_model import build
-from packed_linear import set_kernel
 from transformers import AutoTokenizer
 try:
     from transformers import StaticCache
 except ImportError:
     StaticCache = None
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+if DEVICE == "cuda":
+    from build_packed_model import build
+    from packed_linear import set_kernel
+else:
+    from build_cpu_model import build_cpu
+
 # Configuration
 MODEL_ID = "Qwen/Qwen3-4B"
-PACKED_PATH = os.path.join(PARENT_DIR, "save_models", "Qwen3-4B-LATTICE_pd0.01.lat.pt")
+PACKED_PATH = os.path.join(SCRIPT_DIR, "Qwen3-4B-LATTICE_pd0.01.lat.pt")
+if not os.path.exists(PACKED_PATH):
+    PACKED_PATH = os.path.join(PARENT_DIR, "save_models", "Qwen3-4B-LATTICE_pd0.01.lat.pt")
 ROT_PATH = os.path.join(SCRIPT_DIR, "rot_4b_LR.pt")
 KERNEL_VERSION = "dense"
 HOST = "0.0.0.0"
 PORT = 7860
 
 print("=" * 70)
-print("  OneBit AI: Loading Qwen3-4B LATTICE (Packed Ternary W1.58)...")
+print(f"  OneBit AI: Loading Qwen3-4B LATTICE on {DEVICE.upper()} (Packed Ternary W1.58)...")
 print("=" * 70)
 
-set_kernel(KERNEL_VERSION)
 t_start = time.time()
-model, _ = build(MODEL_ID, PACKED_PATH, ROT_PATH, device="cuda", verbose=True)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, local_files_only=True)
-vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
-print(f"[Model Ready in {time.time() - t_start:.1f}s | {vram_gb:.2f} GiB VRAM]")
+if DEVICE == "cuda":
+    set_kernel(KERNEL_VERSION)
+    model, _ = build(MODEL_ID, PACKED_PATH, ROT_PATH, device="cuda", verbose=True)
+    vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+    print(f"[Model Ready in {time.time() - t_start:.1f}s | {vram_gb:.2f} GiB VRAM]")
+else:
+    model = build_cpu(MODEL_ID, PACKED_PATH, ROT_PATH, verbose=True)
+    vram_gb = 0.0
+    print(f"[Model Ready on CPU in {time.time() - t_start:.1f}s]")
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, local_files_only=True)
+except Exception:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
 GRAPH_BUCKETS = [512, 1024, 2048]
 persistent_graphs = {}
@@ -131,7 +148,7 @@ def format_chat_prompt(system_prompt, messages, max_prompt_budget=1536):
     except TypeError:
         return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
-if StaticCache is not None:
+if DEVICE == "cuda" and StaticCache is not None:
     print(f"[CUDA Graph] Pre-capturing multi-bucket decode graphs {GRAPH_BUCKETS}...", flush=True)
     static_in = torch.zeros((1, 1), dtype=torch.long, device="cuda")
     static_pos = torch.zeros((1,), dtype=torch.long, device="cuda")
@@ -479,11 +496,11 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="meta-card">
       <div class="label">Hardware Accelerator</div>
-      <div class="val">NVIDIA RTX 5070 (Triton)</div>
+      <div class="val">""" + ("NVIDIA RTX 5070 (Triton)" if DEVICE == "cuda" else "Intel Core i7 CPU (Mac)") + """</div>
     </div>
     <div class="meta-card">
-      <div class="label">Resident VRAM</div>
-      <div class="val" id="vram-display">""" + f"{vram_gb:.2f} GiB" + """</div>
+      <div class="label">""" + ("Resident VRAM" if DEVICE == "cuda" else "Memory / RAM") + """</div>
+      <div class="val" id="vram-display">""" + (f"{vram_gb:.2f} GiB" if DEVICE == "cuda" else "Standalone BF16") + """</div>
     </div>
   </div>
 
@@ -508,15 +525,15 @@ HTML_PAGE = """<!DOCTYPE html>
     <div style="font-weight:600; font-size:14px; color:#fff;">Qwen3-4B-LATTICE_pd0.01</div>
     <div class="header-badges">
       <span class="badge">W1.58A16</span>
-      <span class="badge">Triton v4_w1</span>
-      <span class="badge" style="background:#064e3b; color:#6ee7b7; border-color:#059669;">~20 tok/s</span>
+      <span class="badge" id="mode-badge">Loading...</span>
+      <span class="badge" id="speed-badge" style="background:#064e3b; color:#6ee7b7; border-color:#059669;">Ready</span>
     </div>
   </header>
 
   <div class="chat-box" id="chat-box">
     <div class="welcome-card" id="welcome-card">
       <h2>Welcome to OneBit AI</h2>
-      <p>Running packed ternary weights directly against custom Triton GEMV kernels in GPU VRAM.</p>
+      <p id="welcome-desc">Running packed ternary weights directly in memory.</p>
       <div class="suggestions">
         <button class="suggestion-btn" onclick="sendSuggestion('Explain how ternary lattice quantization works in simple terms.')">
           💡 <strong>Quantization:</strong> How ternary lattice works
@@ -549,6 +566,22 @@ let chatHistory = [];
 let isGenerating = false;
 let currentRequestId = null;
 let currentAbortController = null;
+
+async function updateStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    if (data.ready) {
+      const modeBadge = document.getElementById('mode-badge');
+      if (modeBadge) modeBadge.innerText = data.device === 'cuda' ? 'Triton v4_w1 (CUDA)' : 'Mac CPU (bfloat16)';
+      const speedBadge = document.getElementById('speed-badge');
+      if (speedBadge) speedBadge.innerText = data.device === 'cuda' ? '~42 tok/s' : 'Standalone Local';
+      const welcomeP = document.getElementById('welcome-desc');
+      if (welcomeP) welcomeP.innerText = data.device === 'cuda' ? 'Running packed ternary weights directly against custom Triton GEMV kernels in GPU VRAM.' : 'Running packed ternary weights on Mac CPU in native bfloat16 without internet.';
+    }
+  } catch(e) {}
+}
+updateStatus();
 
 function autoResize(el) {
   el.style.height = 'auto';
@@ -789,6 +822,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/" or parsed.path == "/index.html":
@@ -811,10 +852,11 @@ class WebUIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
         elif parsed.path == "/api/status":
-            vram = torch.cuda.memory_allocated() / (1024 ** 3)
+            vram = torch.cuda.memory_allocated() / (1024 ** 3) if DEVICE == "cuda" else 0.0
             payload = json.dumps({
                 "model": MODEL_ID,
-                "quant": "LATTICE Ternary W1.58 (Dense-T1 + CUDA Graph)",
+                "device": DEVICE,
+                "quant": "LATTICE Ternary W1.58 (CUDA Graph + Dense-T1)" if DEVICE == "cuda" else "LATTICE Ternary W1.58 (Standalone Mac CPU / BF16)",
                 "vram_gb": round(vram, 2),
                 "ready": True
             }).encode("utf-8")
@@ -911,7 +953,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
 
             # Execute generation inside lock
             with model_lock:
-                input_ids = tokenizer(prompt_text, return_tensors="pt").to("cuda")
+                input_ids = tokenizer(prompt_text, return_tensors="pt").to(DEVICE)
                 plen = input_ids["input_ids"].shape[1]
 
                 stop_ids = {tokenizer.eos_token_id}
@@ -937,7 +979,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     chosen_cap = MAX_CAP
 
                 bucket = persistent_graphs.get(chosen_cap)
-                can_use_graph = (bucket is not None and available_tokens >= 16)
+                can_use_graph = (DEVICE == "cuda" and bucket is not None and available_tokens >= 16)
                 if can_use_graph:
                     persistent_cache = bucket["cache"]
                     persistent_graph = bucket["graph"]
@@ -1008,14 +1050,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
                             msg = f"data: {json.dumps({'token': token_str, 'done': False})}\n\n"
                             token_queue.put(msg)
 
-                            pos = torch.tensor([plen + i], device="cuda")
+                            pos = torch.tensor([plen + i], device=DEVICE)
                             outputs = model(input_ids=next_token, past_key_values=past_key_values, use_cache=True, cache_position=pos)
                             past_key_values = outputs.past_key_values
                             logits = outputs.logits[:, -1:]
 
                 t_total = time.time() - (t_decode_start if t_decode_start > 0 else t_gen_start)
                 tok_per_sec = generated_count / max(t_total, 1e-5)
-                vram_now = torch.cuda.memory_allocated() / (1024 ** 3)
+                vram_now = torch.cuda.memory_allocated() / (1024 ** 3) if DEVICE == "cuda" else 0.0
 
                 done_msg = f"data: {json.dumps({'done': True, 'stats': {'tokens': generated_count, 'time': round(t_total, 2), 'tok_per_sec': round(tok_per_sec, 1), 'vram_gb': round(vram_now, 2)}})}\n\n"
                 token_queue.put(done_msg)
