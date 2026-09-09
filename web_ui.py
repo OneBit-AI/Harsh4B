@@ -510,12 +510,12 @@ HTML_PAGE = """<!DOCTYPE html>
       <input type="range" id="temp-input" min="0" max="1.5" step="0.05" value="0.7" oninput="document.getElementById('temp-val').innerText=this.value">
     </div>
     <div>
-      <div class="setting-label"><span>Max Tokens</span><span id="max-val">512</span></div>
-      <input type="range" id="max-input" min="64" max="2048" step="64" value="512" oninput="document.getElementById('max-val').innerText=this.value">
+      <div class="setting-label"><span>Max Tokens</span><span id="max-val">128</span></div>
+      <input type="range" id="max-input" min="32" max="1024" step="32" value="128" oninput="document.getElementById('max-val').innerText=this.value">
     </div>
     <div>
       <div class="setting-label"><span>System Prompt</span></div>
-      <textarea class="sys-prompt" id="sys-prompt">You are a helpful and concise AI assistant.</textarea>
+      <textarea class="sys-prompt" id="sys-prompt">You are a helpful assistant.</textarea>
     </div>
   </div>
 </aside>
@@ -658,10 +658,10 @@ async function sendMessage() {
   // Prepare Bot Message
   const botMsgEl = appendMessage('bot', '');
   const contentEl = botMsgEl.querySelector('.msg-content');
-  contentEl.innerHTML = '<span class="cursor"></span>';
+  contentEl.innerHTML = '<div style="display:flex; align-items:center; gap:8px; color:#a5b4fc; font-size:13px; padding:4px 0;"><span class="status-dot" style="background:#6366f1; box-shadow:0 0 8px #6366f1;"></span> <em>Processing prompt on CPU (takes ~30-45s)...</em></div>';
 
   const temp = parseFloat(document.getElementById('temp-input').value) || 0.7;
-  const maxTokens = parseInt(document.getElementById('max-input').value) || 512;
+  const maxTokens = parseInt(document.getElementById('max-input').value) || 128;
   const sysPrompt = document.getElementById('sys-prompt').value || '';
 
   currentRequestId = 'req_' + Date.now();
@@ -711,6 +711,7 @@ async function sendMessage() {
         try {
           const payload = JSON.parse(jsonStr);
           if (payload.token) {
+            if (!accumulatedText) contentEl.innerHTML = '';
             accumulatedText += payload.token;
             contentEl.innerHTML = formatMarkdown(accumulatedText) + '<span class="cursor"></span>';
             scrollBottom();
