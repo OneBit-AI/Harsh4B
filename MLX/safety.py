@@ -251,8 +251,18 @@ def main():
     parser.add_argument('--reserve-gib', type=float, default=4.0,
                         help='minimum free system memory to maintain, in GiB')
     parser.add_argument('--kill', action='store_true')
+    parser.add_argument('--clear', action='store_true',
+                        help='remove the stop latch after inspecting the previous run')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.clear:
+        stop = Path(args.stop_file)
+        if stop.exists():
+            stop.unlink()
+            print('Stop latch cleared.')
+        else:
+            print('No stop latch present.')
+        return 0
     if args.kill:
         Path(args.stop_file).parent.mkdir(parents=True, exist_ok=True)
         Path(args.stop_file).touch(exist_ok=True)
