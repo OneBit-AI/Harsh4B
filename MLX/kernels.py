@@ -128,6 +128,61 @@ def _lattice_kernel():
     ''')
 
 
+@lru_cache(None)
+def _lattice_kernel_v2():
+    """Decode 16 weights per packed load and hoist each block's scale table.
+
+    The fast path requires 16-aligned input and block widths, which includes
+    every projection in the Qwen3-4B LATTICE checkpoint (BS=128).
+    """
+    return mx.fast.metal_kernel(name='lattice_dense_t1_gemv_v2', input_names=['x', 'mid', 't0', 't1', 'scales', 'bias'], output_names=['out'], source=r'''
+        uint lane = thread_index_in_simdgroup;
+        uint row = thread_position_in_grid.x / 32;
+        float acc = 0.0f;
+        if (row < OC) {
+            device const uchar* mrow = mid + row * (IC / 4);
+            device const uchar* t0row = t0 + row * (IC / 4);
+            device const uchar* t1row = t1 + row * (IC / 4);
+            for (uint v = lane; v < IC / 16; v += 32) {
+                uint mb = *(device const uint*)(mrow + v * 4);
+                uint c0b = *(device const uint*)(t0row + v * 4);
+                uint c1b = *(device const uint*)(t1row + v * 4);
+                uint col = v * 16;
+                uint s = (row * NB + col / BS) * 10;
+
+                // The ten values are shared by all 16 weights in this vector.
+                // Explicit scalar loads let Metal keep the table in registers
+                // instead of issuing two or three indexed loads per weight.
+                float mu0 = float(scales[s + 0]);
+                float mu1 = float(scales[s + 1]);
+                float mu2 = float(scales[s + 2]);
+                float mu3 = float(scales[s + 3]);
+                float a00 = float(scales[s + 4]);
+                float a01 = float(scales[s + 5]);
+                float a02 = float(scales[s + 6]);
+                float a03 = float(scales[s + 7]);
+                float a10 = float(scales[s + 8]);
+                float a11 = float(scales[s + 9]);
+
+                for (uint j = 0; j < 16; ++j) {
+                    uint shift = 2 * j;
+                    uint m = (mb >> shift) & 3;
+                    uint c0 = (c0b >> shift) & 3;
+                    uint c1 = (c1b >> shift) & 3;
+                    float muv = m == 0 ? mu0 : (m == 1 ? mu1 : (m == 2 ? mu2 : mu3));
+                    float a0v = m == 0 ? a00 : (m == 1 ? a01 : (m == 2 ? a02 : a03));
+                    float a1v = m == 0 ? a10 : (m == 1 ? a11 : 0.0f);
+                    float v0 = float(c0 == 1) - float(c0 == 2);
+                    float v1 = float(c1 == 1) - float(c1 == 2);
+                    acc += (muv + a0v * v0 + a1v * v1) * float(x[col + j]);
+                }
+            }
+        }
+        float total = simd_sum(acc);
+        if (lane == 0 && row < OC) out[row] = T(total + float(bias[row]));
+    ''')
+
+
 def lattice_gemv(x, maskid, t0, t1_dense, mu, a0, a1, blocksize, bias=None):
     width = x.shape[-1]
     rows = maskid.shape[0]
@@ -147,7 +202,8 @@ def lattice_gemv(x, maskid, t0, t1_dense, mu, a0, a1, blocksize, bias=None):
 
 def _lattice_prepared(x, maskid, t0, t1_dense, scales, bias, blocksize):
     width, rows, nb = x.shape[-1], maskid.shape[0], scales.shape[1]
-    return _lattice_kernel()(inputs=[x, maskid, t0, t1_dense, scales, bias],
+    kernel = _lattice_kernel_v2() if width % 16 == 0 and blocksize % 16 == 0 else _lattice_kernel()
+    return kernel(inputs=[x, maskid, t0, t1_dense, scales, bias],
         template=[('T', x.dtype), ('IC', width), ('OC', rows), ('BS', blocksize), ('NB', nb)],
         grid=(((rows + 3) // 4) * 128, 1, 1), threadgroup=(128, 1, 1),
         output_shapes=[(rows,)], output_dtypes=[x.dtype])[0].reshape(*x.shape[:-1], rows)
@@ -171,8 +227,11 @@ class LatticeLinear:
             raise ValueError('invalid bias shape')
         self.width, self.blocksize = width, blocksize
         self.maskid, self.t0, self.t1 = maskid, t0, t1_dense
-        # Match CUDA's FP32 reconstruction even when source scales are FP16.
-        self.scales = mx.contiguous(mx.concatenate([mu,a0,a1], axis=0).transpose(1,2,0)).astype(mx.float32)
+        # Checkpoint scales are FP16. Keep that exact deployed representation;
+        # the kernel promotes each value to FP32 before reconstruction. This
+        # avoids an unnecessary 2x expansion of all per-block scale tables.
+        scale_dtype = mx.float16 if mu.dtype == a0.dtype == a1.dtype == mx.float16 else mx.float32
+        self.scales = mx.contiguous(mx.concatenate([mu,a0,a1], axis=0).transpose(1,2,0)).astype(scale_dtype)
         self.bias = mx.zeros((rows,), dtype=mx.float32) if bias is None else bias.astype(mx.float32)
         mx.eval(self.scales, self.bias)
 

@@ -30,3 +30,7 @@ MLX/runs/
 runs/
 **/runs/
 *.jsonl
+
+# MLX related
+tokenizer.json
+test.py
