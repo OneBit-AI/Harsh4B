@@ -114,9 +114,11 @@ def lifeline_worker(owner_pid, workload_pid, ready, stop_file):
         while owner.is_running() and owner.status() != psutil.STATUS_ZOMBIE:
             time.sleep(0.1)
     finally:
-        kill_group(workload_pid)
-        Path(stop_file).parent.mkdir(parents=True, exist_ok=True)
-        Path(stop_file).touch(exist_ok=True)
+        try:
+            kill_group(workload_pid)
+        finally:
+            Path(stop_file).parent.mkdir(parents=True, exist_ok=True)
+            Path(stop_file).touch(exist_ok=True)
 
 
 def supervise(command, log, stop_file, limits=Limits(), *, _sensor_target=sensor_worker):
@@ -147,6 +149,21 @@ def supervise(command, log, stop_file, limits=Limits(), *, _sensor_target=sensor
         def emit(event, **fields):
             output.write(json.dumps(dict(event=event, elapsed=time.monotonic() - started, **fields)) + '\n')
             output.flush()
+        def stop_workload():
+            nonlocal reason, code
+            try:
+                kill_group(child.pid)
+            except OSError as exc:
+                # A failed cleanup signal must not skip the stop latch and
+                # final event (or conceal the original sensor violation).
+                emit('kill_error', pid=child.pid, error=repr(exc))
+                reason = reason or f'workload group termination failed: {exc}'
+                code = 137
+                if child.poll() is None:
+                    try:
+                        child.kill()
+                    except OSError as fallback:
+                        emit('kill_error', pid=child.pid, error=repr(fallback))
         try:
             sensor.start()
             first = samples.get(timeout=5)
@@ -205,22 +222,26 @@ def supervise(command, log, stop_file, limits=Limits(), *, _sensor_target=sensor
                 if reason:
                     break
             if reason:
-                kill_group(child.pid)
+                stop_workload()
                 code = 137
             else:
                 code = child.wait()
         except BaseException as exc:
             reason = f'{type(exc).__name__}: {exc}'
             if child is not None:
-                kill_group(child.pid)
+                stop_workload()
                 code = 137
         finally:
             if gate_write is not None:
                 os.close(gate_write)
             if child is not None:
                 # Kill any remaining descendants in the owned group on all exits.
-                kill_group(child.pid)
-                child.wait(timeout=5)
+                stop_workload()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    reason = reason or 'workload did not exit after termination'
+                    code = 137
             if lifeline is not None:
                 if lifeline.is_alive():
                     lifeline.kill()

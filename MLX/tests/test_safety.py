@@ -104,6 +104,28 @@ def test_deadline_kills_workload(tmp_path):
     assert json.loads(log.read_text().splitlines()[-1])['reason'] == 'wall time limit'
 
 
+@pytest.mark.parametrize('after_kill', [False, True])
+def test_signal_error_preserves_stop_latch_and_final_event(tmp_path, monkeypatch, after_kill):
+    from MLX import safety
+    real_kill = safety.kill_group
+    def signal_error(pid):
+        if after_kill:
+            real_kill(pid)
+        raise PermissionError('injected group cleanup error')
+    monkeypatch.setattr(safety, 'kill_group', signal_error)
+    log, stop = tmp_path/'guard.jsonl', tmp_path/'STOP'
+    rc = supervise([sys.executable, '-c', 'import time; time.sleep(60)'], log, stop,
+                   Limits(sensor_timeout=0.3), _sensor_target=thermal_fault)
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    assert rc == 137
+    assert stop.exists()
+    assert any(e['event'] == 'kill_error' for e in events)
+    assert events[-1]['event'] == 'finished'
+    assert events[-1]['reason'] == 'thermal state is not nominal'
+    pid = next(e['pid'] for e in events if e['event'] == 'armed')
+    assert not psutil.pid_exists(pid)
+
+
 def test_secondary_watchdog_survives_supervisor_sigkill(tmp_path):
     log, stop = tmp_path/'guard.jsonl',tmp_path/'STOP'
     script = ('import sys; from MLX.safety import supervise; '

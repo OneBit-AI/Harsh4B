@@ -155,21 +155,53 @@ def expand_t1(packed: dict) -> np.ndarray:
     """Restore compact global T1 codes to LATTICE's dense per-row 2-bit layout."""
     rows, width = map(int, packed["shape"])
     maskid = packed["maskid"].numpy()
-    modes = unpack_codes(maskid, width)
-    second_order = modes < 2
-    offsets = np.cumsum(second_order.reshape(-1), dtype=np.int64) - 1
-    if int(second_order.sum()) != int(packed["n_T1"]):
-        raise ValueError("T1 count does not match mask IDs")
     source = packed["T1c"].numpy()
-    flat = np.zeros(rows * width, dtype=np.uint8)
-    selected = offsets[second_order.reshape(-1)]
-    flat[second_order.reshape(-1)] = (source[selected >> 2] >> ((selected & 3) * 2)) & 3
-    return pack_codes(flat.reshape(rows, width))
+    dense = np.empty((rows, (width + 3) // 4), dtype=np.uint8)
+    # A whole-projection int64 prefix sum alone took ~190 MiB for each
+    # Qwen MLP matrix, plus several equally sized indexing temporaries.
+    # Bound scratch space independently of matrix size and retain the global
+    # compact offset across chunks (row boundaries need not be byte-aligned).
+    chunk_rows = max(1, 65536 // width)
+    offset = 0
+    for start in range(0, rows, chunk_rows):
+        stop = min(rows, start + chunk_rows)
+        second_order = (unpack_codes(maskid[start:stop], width) < 2).reshape(-1)
+        count = int(second_order.sum())
+        indices = np.arange(offset, offset + count, dtype=np.int64)
+        if offset + count > int(packed["n_T1"]) or (offset + count + 3) // 4 > source.size:
+            raise ValueError("T1 count does not match mask IDs")
+        flat = np.zeros(second_order.size, dtype=np.uint8)
+        flat[second_order] = (source[indices >> 2] >> ((indices & 3) * 2)) & 3
+        dense[start:stop] = pack_codes(flat.reshape(stop - start, width))
+        offset += count
+    if offset != int(packed["n_T1"]):
+        raise ValueError("T1 count does not match mask IDs")
+    return dense
+
+
+def compact_t1_row_starts(maskid: np.ndarray, expected_codes: int) -> np.ndarray:
+    """Compute each row's T1c offset without expanding any weight codes."""
+    values = np.arange(256, dtype=np.uint8)
+    counts = sum(((values >> shift) & 3) < 2 for shift in range(0, 8, 2)).astype(np.uint8)
+    per_row = counts[maskid].sum(axis=1, dtype=np.uint64)
+    starts = np.empty(maskid.shape[0], dtype=np.uint32)
+    starts[0] = 0
+    if starts.size > 1:
+        starts[1:] = np.cumsum(per_row[:-1], dtype=np.uint64).astype(np.uint32)
+    if int(per_row.sum(dtype=np.uint64)) != int(expected_codes):
+        raise ValueError("compact T1 count does not match mask IDs")
+    return starts
 
 
 def rms_norm(mx, x, weight, eps=1e-6):
-    x32 = x.astype(mx.float32)
-    return (x32 * mx.rsqrt(mx.mean(x32 * x32, axis=-1, keepdims=True) + eps) * weight).astype(x.dtype)
+    return mx.fast.rms_norm(x, weight, eps)
+
+
+def attention(mx, q, k, v):
+    return mx.fast.scaled_dot_product_attention(
+        q, k, v, scale=q.shape[-1] ** -0.5,
+        mask="causal" if q.shape[2] > 1 else None,
+    )
 
 
 def mlx_fp16(mx, tensor: TensorRef):
@@ -212,19 +244,25 @@ class LatticeProjection:
         self.out_features, self.in_features = map(int, packed["shape"])
         self.left = mlx_fp16(mx, left)
         self.right = mlx_fp16(mx, right)
-        self.linear = lattice_linear(
-            mx.array(packed["maskid"].numpy()),
-            mx.array(packed["T0"].numpy()),
-            mx.array(expand_t1(packed)),
-            mx.array(packed["mu"].numpy()),
-            mx.array(packed["a0"].numpy()),
-            mx.array(packed["a1"].numpy()),
-            self.in_features,
-            int(packed["blocksize"]),
+        maskid = packed["maskid"].numpy()
+        common = (
+            mx.array(maskid), mx.array(packed["T0"].numpy()),
+            mx.array(packed["mu"].numpy()), mx.array(packed["a0"].numpy()),
+            mx.array(packed["a1"].numpy()), self.in_features, int(packed["blocksize"]),
         )
+        if getattr(lattice_linear, "compact_t1", False):
+            row_starts = compact_t1_row_starts(maskid, int(packed["n_T1"]))
+            self.linear = lattice_linear(
+                common[0], common[1], mx.array(packed["T1c"].numpy()), mx.array(row_starts),
+                *common[2:],
+            )
+            code_buffers = (self.linear.t1_compact, self.linear.row_starts)
+        else:
+            self.linear = lattice_linear(common[0], common[1], mx.array(expand_t1(packed)), *common[2:])
+            code_buffers = (self.linear.t1,)
         # Force host-to-MLX copies before the checkpoint zip is closed.
         mx.eval(self.left, self.right, self.linear.maskid, self.linear.t0,
-                self.linear.t1, self.linear.scales, self.linear.bias)
+                *code_buffers, self.linear.scales, self.linear.bias)
 
     def __call__(self, x):
         shape = x.shape
@@ -288,18 +326,9 @@ class Qwen3Lattice:
             q = apply_rope(mx, q, rope_cos, rope_sin)
             k = apply_rope(mx, k, rope_cos, rope_sin)
             k, v = cache.append(layer_index, k, v)
-            # Group four query heads per KV head and broadcast the KV tensors.
-            # This is equivalent to repeat(..., 4, axis=1) without materializing
-            # four copies of every layer's growing cache.
-            grouped_q = q.reshape(1, 8, 4, q_len, 128)
-            scores = (grouped_q @ k[:, :, None].transpose(0, 1, 2, 4, 3)) / np.sqrt(128)
-            if q_len > 1:
-                total = k.shape[2]
-                mask = mx.triu(mx.full((q_len, total), -mx.inf), k=1 + total - q_len)
-                scores = scores + mask
-            attention = mx.softmax(scores.astype(mx.float32), axis=-1).astype(mx.float16) @ v[:, :, None]
-            attention = attention.transpose(0, 3, 1, 2, 4).reshape(1, q_len, layer["o"].in_features)
-            x = residual + layer["o"](attention)
+            attended = attention(mx, q, k, v)
+            attended = attended.transpose(0, 2, 1, 3).reshape(1, q_len, layer["o"].in_features)
+            x = residual + layer["o"](attended)
             residual = x
             normalized = rms_norm(mx, x, layer["post_norm"])
             gate = layer["gate"](normalized)
@@ -332,6 +361,8 @@ def parse_args():
                         help="Qwen3 tokenizer.json (default: %(default)s)")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--warmup-tokens", type=int, default=8)
+    parser.add_argument("--compact-t1", action="store_true",
+                        help="Use checkpoint-native compact T1 to reduce memory at lower decode speed")
     return parser.parse_args()
 
 
@@ -353,22 +384,24 @@ def main():
         raise SystemExit("--max-new-tokens must be positive and --warmup-tokens cannot be negative")
     if not MODEL_PATH.is_file():
         raise SystemExit(f"Missing required checkpoint: {MODEL_PATH}")
-    try:
-        import mlx.core as mx
-        from MLX.kernels import LatticeLinear
-    except ImportError as exc:
-        raise SystemExit("Run with the MLX environment: .venv-mlx/bin/python test.py ...") from exc
-
-    # Model construction creates short-lived cast/concatenation buffers. Keep
-    # MLX from retaining gigabytes of those buffers while the 4B model loads.
-    mx.set_cache_limit(64 * 2**20)
-
     tokens, tokenizer = input_tokens(args)
+    cpu_started = time.perf_counter()
     state, archive = load_checkpoint()
+    print(f"CPU checkpoint map ready in {time.perf_counter() - cpu_started:.2f}s", flush=True)
     try:
+        try:
+            import mlx.core as mx
+            from MLX.kernels import CompactLatticeLinear, LatticeLinear
+        except ImportError as exc:
+            raise SystemExit("Run with the MLX environment: .venv-mlx/bin/python test.py ...") from exc
+
+        # Model construction creates short-lived cast/concatenation buffers.
+        # Keep MLX from retaining those buffers after CPU-to-device transfer.
+        mx.set_cache_limit(64 * 2**20)
         print(f"Loading {MODEL_PATH.name} ({MODEL_PATH.stat().st_size / 2**30:.2f} GiB) into MLX...", flush=True)
         started = time.perf_counter()
-        model = Qwen3Lattice(mx, LatticeLinear, state)
+        linear_type = CompactLatticeLinear if args.compact_t1 else LatticeLinear
+        model = Qwen3Lattice(mx, linear_type, state)
         mx.eval(model.embed, model.lm_head)
     finally:
         # All mapped tensors have been copied into MLX arrays by Qwen3Lattice.

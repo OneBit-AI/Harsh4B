@@ -8,7 +8,7 @@ import mlx.core as mx
 mx.set_memory_limit(1024 ** 3)
 mx.set_cache_limit(32 * 1024 ** 2)
 
-from MLX.kernels import LatticeLinear, TernaryLinear, bitnet_gemv, lattice_gemv, pack_codes, pack_ternary, unpack_ternary
+from MLX.kernels import CompactLatticeLinear, LatticeLinear, TernaryLinear, bitnet_gemv, lattice_gemv, pack_codes, pack_ternary, unpack_ternary
 
 
 @pytest.mark.parametrize('width,rows', [(1, 1), (73, 7), (128, 8), (1536, 16)])
@@ -57,6 +57,37 @@ def test_lattice_all_masks_tail_bias(width, bs, dtype):
     prefill = mx.array(np.repeat(x[None,:,:],3,axis=1))
     expected_prefill = (np.array(prefill).astype(np.float32) @ w.T + bias).astype(dtype)
     np.testing.assert_allclose(np.array(layer(prefill)), expected_prefill, atol=tolerance, rtol=tolerance)
+
+
+def test_compact_lattice_against_dense_t1():
+    rows, width, bs = 7, 128, 128
+    rng = np.random.default_rng(29)
+    mid = rng.integers(0, 4, (rows, width), dtype=np.uint8)
+    c0 = rng.integers(0, 4, (rows, width), dtype=np.uint8)
+    c1 = rng.integers(0, 4, (rows, width), dtype=np.uint8)
+    selected = c1[mid < 2]
+    selected = np.pad(selected, (0, (-selected.size) % 4))
+    t1c = (selected[0::4] | (selected[1::4] << 2) |
+           (selected[2::4] << 4) | (selected[3::4] << 6)).astype(np.uint8)
+    row_counts = (mid < 2).sum(axis=1, dtype=np.uint32)
+    row_starts = np.zeros(rows, dtype=np.uint32)
+    row_starts[1:] = np.cumsum(row_counts[:-1], dtype=np.uint32)
+    mu = rng.normal(scale=0.1, size=(4, rows, 1)).astype(np.float16)
+    a0 = rng.normal(scale=0.1, size=(4, rows, 1)).astype(np.float16)
+    a1 = rng.normal(scale=0.1, size=(2, rows, 1)).astype(np.float16)
+    x = mx.array(rng.normal(size=(1, width)).astype(np.float16))
+    dense = LatticeLinear(
+        mx.array(pack_codes(mid)), mx.array(pack_codes(c0)), mx.array(pack_codes(c1)),
+        mx.array(mu), mx.array(a0), mx.array(a1), width, bs,
+    )
+    compact = CompactLatticeLinear(
+        mx.array(pack_codes(mid)), mx.array(pack_codes(c0)), mx.array(t1c),
+        mx.array(row_starts), mx.array(mu), mx.array(a0), mx.array(a1), width, bs,
+    )
+    actual, expected = compact(x), dense(x)
+    mx.eval(actual, expected)
+    np.testing.assert_allclose(np.array(actual), np.array(expected), atol=0.002, rtol=0.002)
+    np.testing.assert_allclose(np.array(compact.dense_weight()), np.array(dense.dense_weight()), atol=1e-6)
 
 
 def test_packing_is_lossless():
