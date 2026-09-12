@@ -1,182 +1,15 @@
 #!/usr/bin/env python3
-"""
-OneBit AI - Qwen3-4B LATTICE Ternary Web UI Server
-Hosts a local, responsive web chat interface powered by the packed ternary Triton kernel.
-"""
-
-import os
-import sys
+"""OneBit AI web chat: CUDA, MLX/Metal and CPU share one streaming interface."""
+import argparse
 import json
-import time
+import math
 import queue
-import threading
 import socket
+import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
-# Ensure local kernel modules can be imported
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.dirname(SCRIPT_DIR)
-sys.path.insert(0, SCRIPT_DIR)
-sys.path.insert(0, PARENT_DIR)
-
-import torch
-from transformers import AutoTokenizer
-try:
-    from transformers import StaticCache
-except ImportError:
-    StaticCache = None
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-if DEVICE == "cuda":
-    from build_packed_model import build
-    from packed_linear import set_kernel
-else:
-    from build_cpu_model import build_cpu
-
-# Configuration
-MODEL_ID = "Qwen/Qwen3-4B"
-PACKED_PATH = os.path.join(SCRIPT_DIR, "Qwen3-4B-LATTICE_pd0.01.lat.pt")
-if not os.path.exists(PACKED_PATH):
-    PACKED_PATH = os.path.join(PARENT_DIR, "save_models", "Qwen3-4B-LATTICE_pd0.01.lat.pt")
-ROT_PATH = os.path.join(SCRIPT_DIR, "rot_4b_LR.pt")
-KERNEL_VERSION = "dense"
-HOST = "0.0.0.0"
-PORT = 7860
-
-print("=" * 70)
-print(f"  OneBit AI: Loading Qwen3-4B LATTICE on {DEVICE.upper()} (Packed Ternary W1.58)...")
-print("=" * 70)
-
-t_start = time.time()
-if DEVICE == "cuda":
-    set_kernel(KERNEL_VERSION)
-    model, _ = build(MODEL_ID, PACKED_PATH, ROT_PATH, device="cuda", verbose=True)
-    vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
-    print(f"[Model Ready in {time.time() - t_start:.1f}s | {vram_gb:.2f} GiB VRAM]")
-else:
-    torch.set_num_threads(4)
-    try:
-        torch.set_num_interop_threads(1)
-    except Exception:
-        pass
-    os.environ["KMP_BLOCKTIME"] = "0"
-    model = build_cpu(MODEL_ID, PACKED_PATH, ROT_PATH, verbose=True)
-    vram_gb = 0.0
-    print(f"[Model Ready on CPU in {time.time() - t_start:.1f}s]")
-
-try:
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, local_files_only=True)
-except Exception:
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-
-GRAPH_BUCKETS = [512, 1024, 2048]
-persistent_graphs = {}
-static_in = None
-static_pos = None
-_token_decode_cache = {}
-
-def fast_decode_token(token_id):
-    s = _token_decode_cache.get(token_id)
-    if s is None:
-        s = tokenizer.decode([token_id], skip_special_tokens=True)
-        _token_decode_cache[token_id] = s
-    return s
-
-def sample_next_token(logits, generated_tokens=None, temperature=0.7, top_p=0.9, top_k=50, rep_penalty=1.15):
-    l = logits.reshape(1, -1).clone().float()
-    if rep_penalty != 1.0 and generated_tokens:
-        # High-performance vectorized repetition penalty directly on GPU
-        unique_toks = torch.tensor(list(set(generated_tokens)), device=l.device, dtype=torch.long)
-        token_logits = l[0, unique_toks]
-        l[0, unique_toks] = torch.where(token_logits > 0, token_logits / rep_penalty, token_logits * rep_penalty)
-
-    if temperature <= 0.01:
-        return l.argmax(-1, keepdim=True)
-    l = l / max(temperature, 1e-5)
-
-    # Top-K (val is already sorted in descending order)
-    K = min(top_k if top_k > 0 else 50, l.shape[-1])
-    val, idx = torch.topk(l, K, sorted=True)
-
-    probs = torch.softmax(val, dim=-1)
-    if top_p < 1.0:
-        cum_probs = torch.cumsum(probs, dim=-1)
-        mask = (cum_probs - probs) >= top_p
-        probs[mask] = 0.0
-        p_sum = probs.sum(dim=-1, keepdim=True)
-        probs = torch.where(p_sum > 0, probs / p_sum, torch.zeros_like(probs))
-
-    sampled_idx = torch.multinomial(probs, 1)
-    return idx.gather(-1, sampled_idx)
-
-def format_chat_prompt(system_prompt, messages, max_prompt_budget=1536):
-    """
-    Ensures the chat prompt remains safely within the CUDA Graph static cache budget.
-    Always preserves system prompt and latest user prompt, sliding conversation history
-    to retain the most recent context turns.
-    """
-    sys_msg = [{"role": "system", "content": system_prompt}]
-    if not messages:
-        try:
-            return tokenizer.apply_chat_template(sys_msg, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        except TypeError:
-            return tokenizer.apply_chat_template(sys_msg, tokenize=False, add_generation_prompt=True)
-
-    latest_msg = [messages[-1]]
-    prev_msgs = messages[:-1]
-
-    if len(prev_msgs) <= 2:
-        msgs = sys_msg + messages
-    else:
-        msgs = sys_msg + messages
-        try:
-            txt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        except TypeError:
-            txt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        if len(tokenizer.encode(txt)) > max_prompt_budget:
-            kept = []
-            for m in reversed(prev_msgs):
-                test_msgs = sys_msg + [m] + kept + latest_msg
-                try:
-                    p_txt = tokenizer.apply_chat_template(test_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-                except TypeError:
-                    p_txt = tokenizer.apply_chat_template(test_msgs, tokenize=False, add_generation_prompt=True)
-                if len(tokenizer.encode(p_txt)) <= max_prompt_budget:
-                    kept.insert(0, m)
-                else:
-                    break
-            msgs = sys_msg + kept + latest_msg
-
-    try:
-        return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-    except TypeError:
-        return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-
-if DEVICE == "cuda" and StaticCache is not None:
-    print(f"[CUDA Graph] Pre-capturing multi-bucket decode graphs {GRAPH_BUCKETS}...", flush=True)
-    static_in = torch.zeros((1, 1), dtype=torch.long, device="cuda")
-    static_pos = torch.zeros((1,), dtype=torch.long, device="cuda")
-    for cap in GRAPH_BUCKETS:
-        cache = StaticCache(config=model.config, max_batch_size=1, max_cache_len=cap,
-                            device="cuda", dtype=torch.float16)
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.no_grad(), torch.cuda.stream(s):
-            for _ in range(3):
-                model(input_ids=static_in, past_key_values=cache, use_cache=True, cache_position=static_pos)
-        torch.cuda.current_stream().wait_stream(s)
-
-        g = torch.cuda.CUDAGraph()
-        with torch.no_grad(), torch.cuda.graph(g):
-            out = model(input_ids=static_in, past_key_values=cache, use_cache=True,
-                        cache_position=static_pos).logits
-        persistent_graphs[cap] = {"cache": cache, "graph": g, "out": out}
-    print(f"[CUDA Graph] Multi-bucket decode graphs {GRAPH_BUCKETS} ready! (Zero startup latency, 35-44 tok/s)", flush=True)
-
-model_lock = threading.Lock()
-generation_stop_flags = {}
+from inference_runtime import create_runtime
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -502,11 +335,11 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="meta-card">
       <div class="label">Hardware Accelerator</div>
-      <div class="val">""" + ("NVIDIA RTX 5070 (Triton)" if DEVICE == "cuda" else "Intel Core i7 CPU (Mac)") + """</div>
+      <div class="val" id="hardware-display">Loading...</div>
     </div>
     <div class="meta-card">
-      <div class="label">""" + ("Resident VRAM" if DEVICE == "cuda" else "Memory / RAM") + """</div>
-      <div class="val" id="vram-display">""" + (f"{vram_gb:.2f} GiB" if DEVICE == "cuda" else "Standalone BF16") + """</div>
+      <div class="label" id="memory-label">Runtime memory</div>
+      <div class="val" id="vram-display">Loading...</div>
     </div>
   </div>
 
@@ -579,11 +412,14 @@ async function updateStatus() {
     const data = await res.json();
     if (data.ready) {
       const modeBadge = document.getElementById('mode-badge');
-      if (modeBadge) modeBadge.innerText = data.device === 'cuda' ? 'Triton v4_w1 (CUDA)' : 'CPU Native (Absorbed KOTMS)';
+      if (modeBadge) modeBadge.innerText = data.quant;
       const speedBadge = document.getElementById('speed-badge');
-      if (speedBadge) speedBadge.innerText = data.device === 'cuda' ? '~42 tok/s (RTX 5070)' : '~0.85 tok/s (Intel i7)';
+      if (speedBadge) speedBadge.innerText = 'Ready';
+      document.getElementById('hardware-display').innerText = data.hardware;
+      document.getElementById('vram-display').innerText = data.vram_gb.toFixed(2) + ' GiB';
+      document.getElementById('memory-label').innerText = data.device === 'mlx' ? 'MLX unified memory' : data.device === 'cuda' ? 'Resident VRAM' : 'Process RAM';
       const welcomeP = document.getElementById('welcome-desc');
-      if (welcomeP) welcomeP.innerText = data.device === 'cuda' ? 'Running packed ternary weights directly against custom Triton GEMV kernels in GPU VRAM.' : 'Running locally on Mac CPU with pre-absorbed KOTMS rotations in native PyTorch bfloat16.';
+      if (welcomeP) welcomeP.innerText = 'Running locally with ' + data.quant + '.';
     }
   } catch(e) {}
 }
@@ -664,7 +500,7 @@ async function sendMessage() {
   // Prepare Bot Message
   const botMsgEl = appendMessage('bot', '');
   const contentEl = botMsgEl.querySelector('.msg-content');
-  contentEl.innerHTML = '<div style="display:flex; align-items:center; gap:8px; color:#a5b4fc; font-size:13px; padding:4px 0;"><span class="status-dot" style="background:#6366f1; box-shadow:0 0 8px #6366f1;"></span> <em>Processing prompt on CPU (takes ~15-20s)...</em></div>';
+  contentEl.innerHTML = '<div style="display:flex; align-items:center; gap:8px; color:#a5b4fc; font-size:13px; padding:4px 0;"><span class="status-dot" style="background:#6366f1; box-shadow:0 0 8px #6366f1;"></span> <em>Processing prompt; output will stream when ready...</em></div>';
 
   const temp = parseFloat(document.getElementById('temp-input').value) || 0.7;
   const maxTokens = parseInt(document.getElementById('max-input').value) || 128;
@@ -723,12 +559,21 @@ async function sendMessage() {
             scrollBottom();
           }
           if (payload.done) {
+            if (payload.error) {
+              contentEl.textContent = 'Generation failed: ' + payload.error;
+              isGenerating = false;
+              setButtonToSend();
+              currentAbortController = null;
+              return;
+            }
             contentEl.innerHTML = formatMarkdown(accumulatedText);
             if (payload.stats) {
               const statsDiv = document.createElement('div');
               statsDiv.className = 'msg-stats';
               statsDiv.innerHTML = `<span>⚡ ${payload.stats.tok_per_sec.toFixed(1)} tok/s</span><span>📊 ${payload.stats.tokens} tokens</span><span>⏱️ ${payload.stats.time.toFixed(1)}s</span>`;
               botMsgEl.appendChild(statsDiv);
+              document.getElementById('speed-badge').innerText = payload.stats.tok_per_sec.toFixed(1) + ' tok/s';
+              document.getElementById('vram-display').innerText = payload.stats.vram_gb.toFixed(2) + ' GiB';
             }
             chatHistory.push({ role: 'assistant', content: accumulatedText });
             isGenerating = false;
@@ -742,10 +587,7 @@ async function sendMessage() {
       }
     }
 
-    contentEl.innerHTML = formatMarkdown(accumulatedText);
-    if (accumulatedText && (!chatHistory.length || chatHistory[chatHistory.length - 1].content !== accumulatedText)) {
-      chatHistory.push({ role: 'assistant', content: accumulatedText });
-    }
+    throw new Error('Generation connection closed before completion. Check the server or watchdog log.');
   } catch (err) {
     if (err.name !== 'AbortError') {
       contentEl.innerHTML = `<span style="color:#ef4444; font-weight: 500;">⚠️ Error: ${err.message}</span>`;
@@ -813,293 +655,177 @@ function scrollBottom() {
 """
 
 
+class InferenceServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, runtime):
+        super().__init__(address, WebUIHandler)
+        self.runtime = runtime
+        self.model_lock = threading.Lock()
+        self.request_lock = threading.Lock()
+        self.requests = {}
+
+
 class WebUIHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        print(f"[HTTP] {self.command} {self.path} -> {args[1] if len(args) > 1 else ''}", flush=True)
-
-    def do_OPTIONS(self):
-        print(f"[HTTP] OPTIONS {self.path} (CORS preflight)", flush=True)
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, *")
-        self.send_header("Access-Control-Max-Age", "86400")
-        self.send_header("Content-Length", "0")
+    def _send(self, code, body, content_type="application/json"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
+        self.wfile.write(body)
         self.close_connection = True
 
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
+    def _json(self, code, payload):
+        self._send(code, json.dumps(payload).encode("utf-8"))
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if not 0 < length <= 1024 * 1024:
+            raise ValueError("Request body must be between 1 byte and 1 MiB")
+        data = json.loads(self.rfile.read(length))
+        if not isinstance(data, dict):
+            raise ValueError("Expected a JSON object")
+        return data
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/" or parsed.path == "/index.html":
-            content = HTML_PAGE.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(content)))
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(content)
-            self.close_connection = True
-        elif parsed.path == "/favicon.ico":
-            self.send_response(204)
-            self.send_header("Content-Length", "0")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.close_connection = True
-        elif parsed.path == "/api/status":
-            vram = torch.cuda.memory_allocated() / (1024 ** 3) if DEVICE == "cuda" else 0.0
-            payload = json.dumps({
-                "model": MODEL_ID,
-                "device": DEVICE,
-                "quant": "LATTICE Ternary W1.58 (CUDA Graph + Dense-T1)" if DEVICE == "cuda" else "LATTICE Ternary W1.58 (Standalone Mac CPU / BF16)",
-                "vram_gb": round(vram, 2),
-                "ready": True
-            }).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(payload)
-            self.close_connection = True
+        path = urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            self._send(200, HTML_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        elif path == "/api/status":
+            self._json(200, self.server.runtime.status())
+        elif path == "/favicon.ico":
+            self._send(204, b"")
         else:
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.close_connection = True
+            self._json(404, {"error": "Not found"})
+
+    def do_HEAD(self):
+        self._send(200, b"", "text/html; charset=utf-8")
 
     def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/stop":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length)
-            data = json.loads(body.decode("utf-8"))
-            req_id = data.get("request_id")
-            if req_id:
-                generation_stop_flags[req_id] = True
-            payload = b'{"status":"stopped"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(payload)
-            self.close_connection = True
+        path = urlparse(self.path).path
+        if path not in ("/api/chat", "/api/stop"):
+            self._json(404, {"error": "Not found"})
+            return
+        try:
+            data = self._read_json()
+            request_id = data.get("request_id", "default")
+            if not isinstance(request_id, str) or not 1 <= len(request_id) <= 256:
+                raise ValueError("request_id must be a nonempty string of at most 256 characters")
+            if path == "/api/stop":
+                with self.server.request_lock:
+                    event = self.server.requests.get(request_id)
+                    if event:
+                        event.set()
+                self._json(200, {"status": "stopped"})
+                return
+            messages = data.get("messages")
+            system = data.get("system", "You are a helpful assistant.")
+            if not isinstance(messages, list) or not messages or not isinstance(system, str):
+                raise ValueError("Expected messages and a text system prompt")
+            for message in messages:
+                if (not isinstance(message, dict) or message.get("role") not in ("user", "assistant")
+                        or not isinstance(message.get("content"), str)):
+                    raise ValueError("Messages must have user/assistant roles and text content")
+            if messages[-1]["role"] != "user":
+                raise ValueError("The final message must be from the user")
+            temperature = float(data.get("temperature", 0.7))
+            max_tokens = int(data.get("max_tokens", 128))
+            if not math.isfinite(temperature) or not 0 <= temperature <= 2 or not 1 <= max_tokens <= 1024:
+                raise ValueError("temperature must be 0–2 and max_tokens must be 1–1024")
+            runtime = self.server.runtime
+            prompt = runtime.tokenizer.format(system, messages, runtime.max_context - max_tokens)
+            ids = runtime.tokenizer.encode(prompt)
+        except (ValueError, TypeError, OverflowError) as exc:
+            self._json(400, {"error": str(exc)})
             return
 
-        if parsed.path == "/api/chat":
+        stop = threading.Event()
+        with self.server.request_lock:
+            if request_id in self.server.requests:
+                self._json(409, {"error": "request_id is already active"})
+                return
+            self.server.requests[request_id] = stop
+        disconnected, stream_done = threading.Event(), threading.Event()
+        chunks = queue.Queue(maxsize=256)
+
+        def cancelled():
+            return stop.is_set() or disconnected.is_set()
+
+        def publish(payload):
+            chunk = f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+            while not disconnected.is_set():
+                try:
+                    chunks.put(chunk, timeout=0.1)
+                    return
+                except queue.Full:
+                    pass
+
+        def writer():
             try:
-                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except Exception:
-                pass
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length)
-            data = json.loads(body.decode("utf-8"))
+                while not stream_done.is_set() or not chunks.empty():
+                    try:
+                        chunk = chunks.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except OSError:
+                disconnected.set()
+                stop.set()
 
-            messages = data.get("messages", [])
-            system_prompt = data.get("system", "You are a helpful assistant.")
-            temperature = float(data.get("temperature", 0.7))
-            max_tokens = int(data.get("max_tokens", 512))
-            req_id = data.get("request_id", "default")
-            generation_stop_flags[req_id] = False
-
-            last_user_msg = ""
-            for m in reversed(messages):
-                if m.get("role") == "user":
-                    last_user_msg = m.get("content", "")[:60]
-                    break
-            print(f"[HTTP] /api/chat received prompt: \"{last_user_msg}...\" (history len: {len(messages)})", flush=True)
-
-            # Format chat prompt with sliding context window to fit StaticCache budget
-            prompt_text = format_chat_prompt(system_prompt, messages, max_prompt_budget=3072)
-
+        writer_thread = None
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connection.settimeout(10)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-
-            token_queue = queue.Queue(maxsize=256)
-            stream_done = threading.Event()
-            client_disconnected = threading.Event()
-
-            def stream_worker():
-                while not stream_done.is_set() or not token_queue.empty():
-                    try:
-                        chunk = token_queue.get(timeout=0.02)
-                        try:
-                            self.wfile.write(chunk.encode("utf-8"))
-                            if token_queue.empty():
-                                self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError):
-                            client_disconnected.set()
-                            break
-                        finally:
-                            token_queue.task_done()
-                    except queue.Empty:
-                        pass
-
-            writer_thread = threading.Thread(target=stream_worker, daemon=True)
+            writer_thread = threading.Thread(target=writer, daemon=True)
             writer_thread.start()
-
-            # Execute generation inside lock
-            with model_lock:
-                input_ids = tokenizer(prompt_text, return_tensors="pt").to(DEVICE)
-                plen = input_ids["input_ids"].shape[1]
-
-                stop_ids = {tokenizer.eos_token_id}
-                for tok_s in ["<|im_end|>", "<|endoftext|>"]:
-                    try:
-                        tid = tokenizer.convert_tokens_to_ids(tok_s)
-                        if tid is not None and tid != tokenizer.unk_token_id:
-                            stop_ids.add(tid)
-                    except Exception:
-                        pass
-
-                MAX_CAP = max(GRAPH_BUCKETS)
-                available_tokens = MAX_CAP - plen - 4
-                actual_max_tokens = min(max_tokens, max(1, available_tokens))
-                needed_cap = plen + actual_max_tokens + 4
-
-                chosen_cap = None
-                for cap in sorted(GRAPH_BUCKETS):
-                    if needed_cap <= cap:
-                        chosen_cap = cap
-                        break
-                if chosen_cap is None:
-                    chosen_cap = MAX_CAP
-
-                bucket = persistent_graphs.get(chosen_cap)
-                can_use_graph = (DEVICE == "cuda" and bucket is not None and available_tokens >= 16)
-                if can_use_graph:
-                    persistent_cache = bucket["cache"]
-                    persistent_graph = bucket["graph"]
-                    static_out = bucket["out"]
-
-                t_gen_start = time.time()
-                t_decode_start = 0
-                generated_count = 0
-                generated_tok_list = []
-
-                with torch.no_grad():
-                    if can_use_graph:
-                        persistent_cache.reset()
-                        outputs = model(**input_ids, past_key_values=persistent_cache, use_cache=True,
-                                        cache_position=torch.arange(plen, device="cuda"))
-                        logits = outputs.logits[:, -1:]
-
-                        nxt = sample_next_token(logits, generated_tok_list, temperature=temperature)
-                        token_id = int(nxt)
-                        t_decode_start = time.time()
-                        if token_id not in stop_ids:
-                            token_str = fast_decode_token(token_id)
-                            generated_count += 1
-                            generated_tok_list.append(token_id)
-                            msg = f"data: {json.dumps({'token': token_str, 'done': False})}\n\n"
-                            token_queue.put(msg)
-
-                            cur = nxt.clone()
-                            for i in range(actual_max_tokens - 1):
-                                if generation_stop_flags.get(req_id, False) or client_disconnected.is_set():
-                                    break
-
-                                static_in.copy_(cur)
-                                static_pos.fill_(plen + i)
-                                persistent_graph.replay()
-                                cur_logits = static_out[:, -1:]
-
-                                cur = sample_next_token(cur_logits, generated_tok_list, temperature=temperature)
-                                token_id = int(cur)
-                                if token_id in stop_ids:
-                                    break
-
-                                token_str = fast_decode_token(token_id)
-                                generated_count += 1
-                                generated_tok_list.append(token_id)
-
-                                msg = f"data: {json.dumps({'token': token_str, 'done': False})}\n\n"
-                                token_queue.put(msg)
-                    else:
-                        outputs = model(**input_ids, use_cache=True)
-                        past_key_values = outputs.past_key_values
-                        logits = outputs.logits[:, -1:]
-                        t_decode_start = time.time()
-
-                        for i in range(max_tokens):
-                            if generation_stop_flags.get(req_id, False) or client_disconnected.is_set():
-                                break
-
-                            next_token = sample_next_token(logits, generated_tok_list, temperature=temperature)
-                            token_id = int(next_token)
-                            if token_id in stop_ids:
-                                break
-
-                            token_str = fast_decode_token(token_id)
-                            generated_count += 1
-                            generated_tok_list.append(token_id)
-
-                            msg = f"data: {json.dumps({'token': token_str, 'done': False})}\n\n"
-                            token_queue.put(msg)
-
-                            pos = torch.tensor([plen + i], device=DEVICE)
-                            outputs = model(input_ids=next_token, past_key_values=past_key_values, use_cache=True, cache_position=pos)
-                            past_key_values = outputs.past_key_values
-                            logits = outputs.logits[:, -1:]
-
-                t_total = time.time() - (t_decode_start if t_decode_start > 0 else t_gen_start)
-                tok_per_sec = generated_count / max(t_total, 1e-5)
-                vram_now = torch.cuda.memory_allocated() / (1024 ** 3) if DEVICE == "cuda" else 0.0
-
-                done_msg = f"data: {json.dumps({'done': True, 'stats': {'tokens': generated_count, 'time': round(t_total, 2), 'tok_per_sec': round(tok_per_sec, 1), 'vram_gb': round(vram_now, 2)}})}\n\n"
-                token_queue.put(done_msg)
-                stream_done.set()
-                writer_thread.join(timeout=5.0)
-                print(f"[HTTP] /api/chat done: {generated_count} tokens in {t_total:.2f}s ({tok_per_sec:.1f} tok/s)", flush=True)
-
-            if req_id in generation_stop_flags:
-                del generation_stop_flags[req_id]
-
+            with self.server.model_lock:
+                for payload in runtime.stream(ids, max_tokens, temperature, cancelled):
+                    publish(payload)
+        except Exception as exc:
+            if writer_thread:
+                publish({"done": True, "error": str(exc)})
+        finally:
+            stream_done.set()
+            if writer_thread:
+                writer_thread.join(timeout=11)
+            with self.server.request_lock:
+                self.server.requests.pop(request_id, None)
             self.close_connection = True
-            try:
-                self.connection.shutdown(socket.SHUT_WR)
-            except Exception:
-                pass
-            return
-
-        self.send_response(404)
-        self.send_header("Content-Length", "0")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
 
 
-def run_server():
-    server = ThreadingHTTPServer((HOST, PORT), WebUIHandler)
-    print(f"\n=======================================================")
-    print(f"  OneBit AI Web UI Server running successfully!")
-    print(f"  Local / Tailscale URL: http://{HOST}:{PORT}")
-    print(f"  From your Mac browser: http://100.87.108.82:{PORT}")
-    print(f"=======================================================\n")
+def run_server(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runtime", choices=("auto", "cuda", "mlx", "cpu"), default="auto")
+    parser.add_argument("--model", help="Packed LATTICE checkpoint (default: model.lat.pt or upstream filename)")
+    parser.add_argument("--tokenizer", help="Local Qwen3 tokenizer.json")
+    parser.add_argument("--cpu-cache", help="Directory for reconstructed CPU weight shards")
+    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument("--cpu-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--cpu-layout", choices=("auto", "packed", "absorbed"), default="auto")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7860)
+    args = parser.parse_args(argv)
+    if args.cpu_threads < 1:
+        parser.error("--cpu-threads must be positive")
+    print(f"Loading runtime: {args.runtime}...", flush=True)
+    runtime = create_runtime(args.runtime, args.model, args.tokenizer,
+                             cpu_cache=args.cpu_cache, cpu_threads=args.cpu_threads, cpu_dtype=args.cpu_dtype,
+                             cpu_layout=args.cpu_layout)
+    server = InferenceServer((args.host, args.port), runtime)
+    print(f"{runtime.description} on {runtime.hardware}", flush=True)
+    print(f"Web UI ready at http://{args.host}:{server.server_port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down server...")
+        pass
+    finally:
         server.server_close()
 
 

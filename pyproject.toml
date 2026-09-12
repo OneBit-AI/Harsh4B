@@ -1,0 +1,95 @@
+# Unified dependencies for kernel_optimisations — ALL runtimes, ONE install command.
+#
+#   python3.12 -m venv .venv
+#   .venv/bin/pip install -e ".[all]"
+#
+# Platform markers do the per-environment filtering automatically:
+#   macOS arm64 -> base + cpu + mlx + test   (triton is skipped: Linux-only wheels)
+#   Linux CUDA  -> base + cpu + cuda + test  (mlx is skipped: macOS-only)
+#
+# Runtimes in this repo:
+#   cpu  -> build_cpu_model.py, inference_runtime.TorchRuntime(device="cpu"),
+#           test.py --runtime cpu, web_ui.py --runtime cpu
+#   cuda -> inference_runtime.TorchRuntime(device="cuda") [bucketed graphs],
+#           gemv_triton_v4.py, packed_linear.py, benchmarks/bench_*.py
+#   mlx  -> MLX/ (Metal kernels, lattice model), inference_runtime.MLXRuntime,
+#           test.py --runtime mlx, web_ui.py --runtime mlx
+#
+# NOTE (CUDA path): benchmarks/ and packed_linear.py also import
+#   build_packed_model, gemv_triton, gemm_triton and loader, which are NOT in
+#   this repo (upstream/proprietary modules) — put them on PYTHONPATH yourself.
+#   The CUDA path additionally needs rot_4b_LR.pt next to model.lat.pt.
+
+[project]
+name = "kernel-optimisations"
+version = "0.1.0"
+description = "Qwen3-4B LATTICE ternary inference: CPU, CUDA/Triton and MLX/Metal runtimes"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+# Imported on EVERY runtime path (tokenizer, runner utils, RSS reporting).
+dependencies = [
+    "tokenizers>=0.22,<1",  # inference_runtime, test.py, MLX/generate.py
+    "numpy>=2.0,<3",        # test.py runner, MLX model code
+    "psutil>=7.0,<8",       # inference_runtime.memory_gib, MLX/safety.py
+]
+
+[project.optional-dependencies]
+# PyTorch CPU runtime (Apple Silicon / Linux CPU). Pins verified in .venv-cpu.
+cpu = [
+    "torch==2.14.0",        # model build, prefill/decode, sampling
+    "transformers==4.57.6", # Qwen3 config + AutoModelForCausalLM shell
+    "accelerate==1.15.0",   # init_empty_weights for meta-device assembly
+]
+# NVIDIA CUDA runtime (Linux only). Same torch pin: PyPI ships CUDA wheels
+# for it by default; the CPU wheel is selected automatically on macOS.
+cuda = [
+    "torch==2.14.0",
+    "transformers==4.57.6", # StaticCache bucketed graphs
+    "accelerate==1.15.0",
+    "triton>=3.0; sys_platform == 'linux'",  # Dense-T1 GEMV kernels
+]
+# Apple Silicon Metal runtime. Hugging Face Hub stays below 1.0 so this extra
+# can share one environment with the pinned Transformers release.
+mlx = [
+    "mlx==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "safetensors>=0.5,<1",       # MLX/generate.py, MLX/bench_layers.py
+    "huggingface_hub>=0.34,<1",  # MLX/fetch.py (HfApi, hf_hub_download)
+]
+test = [
+    "pytest>=8,<10",
+]
+# Everything, everywhere, one command: pip install -e ".[all]"
+all = [
+    "torch==2.14.0",
+    "transformers==4.57.6",
+    "accelerate==1.15.0",
+    "triton>=3.0; sys_platform == 'linux'",
+    "mlx==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "safetensors>=0.5,<1",
+    "huggingface_hub>=0.34,<1",
+    "pytest>=8,<10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+# Flat scripts layout: declare packages/modules explicitly so setuptools
+# does not guess (it errors on this layout). `test.py` is intentionally
+# left out as a script (run it as a file) to avoid shadowing stdlib `test`.
+[tool.setuptools.packages.find]
+include = ["MLX*"]
+
+[tool.setuptools]
+py-modules = [
+    "build_cpu_model",
+    "packed_cpu",
+    "inference_runtime",
+    "packed_linear",
+    "gemv_triton_v4",
+    "t1_offsets",
+    "web_ui",
+]

@@ -2,6 +2,9 @@
 .venv/
 .venv-mlx
 .venv-mlx/
+.venv-cpu/
+.cache/*
+*.egg-info/
 env/
 venv/
 
@@ -33,4 +36,3 @@ runs/
 
 # MLX related
 tokenizer.json
-test.py
