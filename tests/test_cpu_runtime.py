@@ -8,6 +8,8 @@ from build_cpu_model import build_cpu, reconstruct_weight
 
 def packed_fixture(rows=5, width=12):
     generator = torch.Generator().manual_seed(17)
+    blocksize = 4
+    nblocks = (width + blocksize - 1) // blocksize
     modes = torch.randint(0, 4, (rows, width), generator=generator, dtype=torch.uint8)
     c0 = torch.randint(0, 4, (rows, width), generator=generator, dtype=torch.uint8)
     c1 = torch.randint(0, 4, (rows, width), generator=generator, dtype=torch.uint8)
@@ -15,10 +17,10 @@ def packed_fixture(rows=5, width=12):
         c = torch.nn.functional.pad(c, (0, (-c.shape[-1]) % 4))
         return c[..., ::4] | c[..., 1::4] << 2 | c[..., 2::4] << 4 | c[..., 3::4] << 6
     selected = c1[modes < 2]
-    mu = torch.randn((4, rows, 3), generator=generator) * 0.05
-    a0 = torch.randn((4, rows, 3), generator=generator) * 0.05
-    a1 = torch.randn((2, rows, 3), generator=generator) * 0.05
-    packed = dict(shape=(rows, width), blocksize=4, nblocks=3, maskid=pack(modes),
+    mu = torch.randn((4, rows, nblocks), generator=generator) * 0.05
+    a0 = torch.randn((4, rows, nblocks), generator=generator) * 0.05
+    a1 = torch.randn((2, rows, nblocks), generator=generator) * 0.05
+    packed = dict(shape=(rows, width), blocksize=blocksize, nblocks=nblocks, maskid=pack(modes),
                   T0=pack(c0), T1c=pack(selected), n_T1=selected.numel(), o2_idx=torch.tensor([0, 1]),
                   mu=mu, a0=a0, a1=a1)
     reference = torch.empty((rows, width))
@@ -73,7 +75,8 @@ def test_native_packed_cpu_matches_dense(compact):
     if platform.system() != "Darwin":
         pytest.skip("Native CPU kernel uses macOS libdispatch")
     from packed_cpu import PackedCPULinear
-    packed, dense = packed_fixture(rows=9)
+    # Width 32 exercises two complete iterations of the 16-lane ARM NEON path.
+    packed, dense = packed_fixture(rows=9, width=32)
     for key in ("mu", "a0", "a1"):
         packed[key] = packed[key].half()
     dense = reconstruct_weight(packed, dtype=torch.float32)
@@ -81,10 +84,10 @@ def test_native_packed_cpu_matches_dense(compact):
         def __init__(self, value): self.value = value.numpy()
         def numpy(self): return self.value
     mapped = {k: Tensor(v) if torch.is_tensor(v) else v for k, v in packed.items()}
-    left, right = torch.eye(3), torch.eye(4)
+    left, right = torch.eye(4), torch.eye(8)
     layer = PackedCPULinear(mapped, Tensor(left), Tensor(right), torch.float32, threads=2, compact=compact)
     for batch in (1, 5):
-        x = torch.randn(batch, 12)
+        x = torch.randn(batch, 32)
         torch.testing.assert_close(layer(x), x @ dense.T, atol=1e-5, rtol=1e-5)
 
 
