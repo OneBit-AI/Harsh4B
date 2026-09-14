@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import statistics
 import time
 from pathlib import Path
 
@@ -225,9 +224,7 @@ def run_cpu(args, tokens, tokenizer):
     print(f"stop: {'end-of-turn token' if token in stop_ids else f'{args.max_new_tokens}-token limit (output may be truncated)'}")
     print(f"prefill: {len(tokens)} tokens in {prefill_seconds:.3f}s ({len(tokens) / prefill_seconds:.2f} tok/s)")
     if measured:
-        median = statistics.median(measured)
-        print(f"decode: {len(measured)} measured tokens | {1 / median:.2f} tok/s median | "
-              f"{statistics.mean(measured):.3f}s/token mean")
+        print(f"decode: {len(measured) / sum(measured):.2f} tok/s")
     else:
         print("decode: no non-EOS tokens were available to benchmark")
 
@@ -305,9 +302,7 @@ def main():
     print(f"stop: {'end-of-turn token' if token in stop_ids else f'{args.max_new_tokens}-token limit (output may be truncated)'}")
     print(f"prefill: {len(tokens)} tokens in {prefill_seconds:.3f}s ({len(tokens) / prefill_seconds:.2f} tok/s)")
     if measured:
-        median = statistics.median(measured)
-        print(f"decode: {len(measured)} measured tokens | {1 / median:.2f} tok/s median | "
-              f"{statistics.mean(measured):.3f}s/token mean")
+        print(f"decode: {len(measured) / sum(measured):.2f} tok/s")
     else:
         print("decode: no non-EOS tokens were available to benchmark")
     print(f"peak MLX memory: {mx.get_peak_memory() / 2**30:.2f} GiB")
