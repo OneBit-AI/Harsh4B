@@ -32,6 +32,7 @@ Thumbs.db
 MLX/runs/
 runs/
 **/runs/
+results/
 *.jsonl
 
 # MLX related

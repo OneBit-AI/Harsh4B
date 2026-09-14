@@ -7,7 +7,14 @@ import numpy as np
 
 import pytest
 
-from cpu_lightspark import MODEL_PATH, _pack_int4, _pack_ternary, configure_threads, parse_args
+from cpu_lightspark import (
+    MODEL_PATH,
+    _pack_int4,
+    _pack_ternary,
+    configure_threads,
+    parse_args,
+    sample_logits,
+)
 
 
 def test_lightspark_cli_defaults_to_local_lattice_configuration():
@@ -15,6 +22,19 @@ def test_lightspark_cli_defaults_to_local_lattice_configuration():
     assert args.model == MODEL_PATH
     assert args.threads == 4
     assert args.warmup_tokens == 8
+    assert args.temperature == 0.7
+    assert args.top_k == 40
+    assert args.top_p == 0.9
+    assert args.repetition_penalty == 1.08
+    assert not args.argmax
+    assert args.gemv_layout == "int4"
+    assert args.gemv_kernel == "prefetch1024"
+
+
+def test_lightspark_argmax_is_an_explicit_sampling_override():
+    args = parse_args(["--prompt", "hello", "--argmax"])
+    logits = np.array([-1.0, 3.0, 2.0], dtype=np.float32)
+    assert sample_logits(logits, [], args, np.random.default_rng(0)) == 1
 
 
 def test_lightspark_thread_configuration(monkeypatch):
@@ -51,20 +71,26 @@ def test_native_int4_sdot_matches_integer_reference():
     # PyTorch, whose bundled libomp cannot safely coexist with LiteSpark's.
     script = r'''
 import numpy as np
-from cpu_lightspark import _native_int4_kernel, _pack_int4
+from cpu_lightspark import _native_int4_kernel, _native_int8_kernel, _pack_int4
 rng = np.random.default_rng(41)
 weights = rng.integers(-7, 8, size=(67, 128), dtype=np.int8)
 activation = rng.integers(-127, 128, size=128, dtype=np.int8)
 scales = rng.random(67, dtype=np.float32)
 activation_scale = 0.007
 output = np.empty(67, dtype=np.float32)
-kernel = _native_int4_kernel()
-assert kernel is not None
 packed = _pack_int4(weights)
-kernel(activation.ctypes.data, packed.ctypes.data, scales.ctypes.data,
-       activation_scale, output.ctypes.data, weights.shape[0], weights.shape[1])
 expected = (weights.astype(np.int32) @ activation.astype(np.int32)).astype(np.float32)
 expected *= scales * activation_scale
+for variant in ("none", "prefetch256", "prefetch512", "prefetch1024"):
+    kernel = _native_int4_kernel(variant)
+    assert kernel is not None
+    kernel(activation.ctypes.data, packed.ctypes.data, scales.ctypes.data,
+           activation_scale, output.ctypes.data, weights.shape[0], weights.shape[1])
+    np.testing.assert_allclose(output, expected, rtol=2e-6, atol=2e-5)
+int8_kernel = _native_int8_kernel()
+assert int8_kernel is not None
+int8_kernel(activation.ctypes.data, weights.ctypes.data, scales.ctypes.data,
+            activation_scale, output.ctypes.data, weights.shape[0], weights.shape[1])
 np.testing.assert_allclose(output, expected, rtol=2e-6, atol=2e-5)
 '''
     environment = dict(os.environ, OMP_NUM_THREADS="2")

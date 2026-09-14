@@ -16,7 +16,8 @@ static inline void unpack_int4_16(
     *high_half = vzip2q_s8(low, high);
 }
 
-extern "C" void litespark_int4_i8_gemv(
+template <int PREFETCH_DISTANCE>
+static void litespark_int4_i8_gemv_impl(
     const int8_t* __restrict__ x,
     const uint8_t* __restrict__ packed_weights,
     const float* __restrict__ weight_scales,
@@ -41,7 +42,10 @@ extern "C" void litespark_int4_i8_gemv(
 
         // 32 packed bytes -> 64 signed int4 values -> four SDOT operations.
         for (; packed_index + 32 <= packed_width; packed_index += 32) {
-            __builtin_prefetch(row + packed_index + 512, 0, 0);
+            if constexpr (PREFETCH_DISTANCE > 0) {
+                __builtin_prefetch(
+                    row + packed_index + PREFETCH_DISTANCE, 0, 0);
+            }
             int8x16_t w0, w1, w2, w3;
             unpack_int4_16(vld1q_u8(row + packed_index), &w0, &w1);
             unpack_int4_16(vld1q_u8(row + packed_index + 16), &w2, &w3);
@@ -62,6 +66,83 @@ extern "C" void litespark_int4_i8_gemv(
             const int input_index = packed_index << 1;
             scalar += static_cast<int32_t>(low) * x[input_index];
             scalar += static_cast<int32_t>(high) * x[input_index + 1];
+        }
+        output[row_index] = static_cast<float>(scalar)
+            * activation_scale * weight_scales[row_index];
+    }
+}
+
+extern "C" void litespark_int4_i8_gemv(
+    const int8_t* x, const uint8_t* weights, const float* scales,
+    float activation_scale, float* output, int rows, int width
+) {
+    litespark_int4_i8_gemv_impl<1024>(
+        x, weights, scales, activation_scale, output, rows, width);
+}
+
+extern "C" void litespark_int4_i8_gemv_nopf(
+    const int8_t* x, const uint8_t* weights, const float* scales,
+    float activation_scale, float* output, int rows, int width
+) {
+    litespark_int4_i8_gemv_impl<0>(
+        x, weights, scales, activation_scale, output, rows, width);
+}
+
+extern "C" void litespark_int4_i8_gemv_pf256(
+    const int8_t* x, const uint8_t* weights, const float* scales,
+    float activation_scale, float* output, int rows, int width
+) {
+    litespark_int4_i8_gemv_impl<256>(
+        x, weights, scales, activation_scale, output, rows, width);
+}
+
+extern "C" void litespark_int4_i8_gemv_pf512(
+    const int8_t* x, const uint8_t* weights, const float* scales,
+    float activation_scale, float* output, int rows, int width
+) {
+    litespark_int4_i8_gemv_impl<512>(
+        x, weights, scales, activation_scale, output, rows, width);
+}
+
+// Paper-inspired control: expand the same row-quantized weights to signed
+// bytes once at load time, then feed them directly to SDOT. This doubles body
+// weight traffic relative to int4 but removes every nibble-unpack instruction.
+extern "C" void litespark_int8_i8_gemv(
+    const int8_t* __restrict__ x,
+    const int8_t* __restrict__ weights,
+    const float* __restrict__ weight_scales,
+    float activation_scale,
+    float* __restrict__ output,
+    int rows,
+    int width
+) {
+#pragma omp parallel for if(rows >= 64) schedule(static)
+    for (int row_index = 0; row_index < rows; ++row_index) {
+        const int8_t* row = weights
+            + static_cast<ptrdiff_t>(row_index) * width;
+        int32x4_t accumulator0 = vdupq_n_s32(0);
+        int32x4_t accumulator1 = vdupq_n_s32(0);
+        int32x4_t accumulator2 = vdupq_n_s32(0);
+        int32x4_t accumulator3 = vdupq_n_s32(0);
+        int index = 0;
+
+        for (; index + 64 <= width; index += 64) {
+            __builtin_prefetch(row + index + 1024, 0, 0);
+            accumulator0 = vdotq_s32(
+                accumulator0, vld1q_s8(row + index), vld1q_s8(x + index));
+            accumulator1 = vdotq_s32(
+                accumulator1, vld1q_s8(row + index + 16), vld1q_s8(x + index + 16));
+            accumulator2 = vdotq_s32(
+                accumulator2, vld1q_s8(row + index + 32), vld1q_s8(x + index + 32));
+            accumulator3 = vdotq_s32(
+                accumulator3, vld1q_s8(row + index + 48), vld1q_s8(x + index + 48));
+        }
+
+        accumulator0 = vaddq_s32(accumulator0, accumulator1);
+        accumulator2 = vaddq_s32(accumulator2, accumulator3);
+        int32_t scalar = vaddvq_s32(vaddq_s32(accumulator0, accumulator2));
+        for (; index < width; ++index) {
+            scalar += static_cast<int32_t>(row[index]) * x[index];
         }
         output[row_index] = static_cast<float>(scalar)
             * activation_scale * weight_scales[row_index];

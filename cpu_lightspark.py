@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
 import json
+import math
 import os
 import platform
 from pathlib import Path
@@ -40,8 +41,8 @@ def configure_threads(threads: int) -> None:
 
 
 @lru_cache(None)
-def _native_int4_kernel():
-    """Build/load the int4 SDOT extension used with LiteSpark activation quantization."""
+def _native_kernel_library():
+    """Build/load the local Apple-ARM SDOT experiment library."""
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         return None
     source = ROOT / "cpu_kernels/litespark_int4.cpp"
@@ -62,11 +63,38 @@ def _native_int4_kernel():
             str(source), "-o", str(temporary),
         ], check=True)
         os.replace(temporary, output)
-    function = ctypes.CDLL(str(output)).litespark_int4_i8_gemv
+    return ctypes.CDLL(str(output))
+
+
+def _native_kernel_function(symbol: str):
+    library = _native_kernel_library()
+    if library is None:
+        return None
+    function = getattr(library, symbol)
     function.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_float, ctypes.c_void_p]
     function.argtypes += [ctypes.c_int, ctypes.c_int]
     function.restype = None
     return function
+
+
+@lru_cache(None)
+def _native_int4_kernel(variant="prefetch1024"):
+    """Packed signed-int4 x int8 SDOT GEMV."""
+    symbols = {
+        "none": "litespark_int4_i8_gemv_nopf",
+        "prefetch256": "litespark_int4_i8_gemv_pf256",
+        "prefetch512": "litespark_int4_i8_gemv_pf512",
+        "prefetch1024": "litespark_int4_i8_gemv",
+    }
+    if variant not in symbols:
+        raise ValueError(f"unknown int4 GEMV kernel variant: {variant}")
+    return _native_kernel_function(symbols[variant])
+
+
+@lru_cache(None)
+def _native_int8_kernel():
+    """Expanded signed-int8 x int8 SDOT GEMV used for the paper-inspired A/B."""
+    return _native_kernel_function("litespark_int8_i8_gemv")
 
 
 def _array(value) -> np.ndarray:
@@ -203,14 +231,15 @@ def _cache_identity(model_path: Path) -> tuple[str, dict]:
 
 @dataclass(frozen=True)
 class LiteSparkProjection:
-    """One row-scaled int4 matrix consumed directly by LiteSpark."""
+    """One row-scaled matrix in the selected int4 or int8 experiment layout."""
 
     weights: np.ndarray
     scales: np.ndarray
+    layout: str = "int4"
 
     @property
     def input_size(self) -> int:
-        return self.weights.shape[1] * 2
+        return self.weights.shape[1] * (2 if self.layout == "int4" else 1)
 
     @property
     def output_size(self) -> int:
@@ -269,7 +298,10 @@ class QwenDecodeState:
 class LiteSparkQwen:
     """Torch-free Qwen3 decode runtime for this repository's LATTICE model."""
 
-    def __init__(self, config, layers, embedding, embedding_scales, final_norm, kernel):
+    def __init__(
+        self, config, layers, embedding, embedding_scales, final_norm, kernel,
+        gemv_kernel="prefetch1024",
+    ):
         self.config = config
         self.layers = layers
         self.embedding = embedding
@@ -277,7 +309,8 @@ class LiteSparkQwen:
         self.lm_head = LiteSparkProjection(embedding, embedding_scales)
         self.final_norm = final_norm
         self.kernel = kernel
-        self.int4_kernel = _native_int4_kernel()
+        self.int4_kernel = _native_int4_kernel(gemv_kernel)
+        self.int8_kernel = _native_int8_kernel()
         head_dim = int(config["head_dim"])
         positions = np.arange(int(config["max_position_embeddings"]), dtype=np.float32)[:, None]
         inv_freq = np.float32(1.0) / np.float32(config["rope_theta"]) ** (
@@ -301,6 +334,15 @@ class LiteSparkQwen:
         out *= self.embedding_scales[token_id]
 
     def _projection(self, projection, values, quantized, activation_scale, out) -> None:
+        if projection.layout == "int8":
+            if self.int8_kernel is None:
+                raise RuntimeError("expanded-int8 GEMV requires Apple ARM64 SDOT")
+            self.int8_kernel(
+                quantized.ctypes.data, projection.weights.ctypes.data,
+                projection.scales.ctypes.data, activation_scale, out.ctypes.data,
+                projection.output_size, projection.input_size,
+            )
+            return
         if self.int4_kernel is None:
             self.kernel.lm_head_int4(
                 projection.weights, projection.scales, values, out,
@@ -396,9 +438,99 @@ class LiteSparkQwen:
         state.position += 1
         return state.logits
 
+    def profile_forward_token(
+        self, token_id: int, state: QwenDecodeState,
+    ) -> tuple[np.ndarray, dict[str, float], dict[str, int], float]:
+        """Time one real ``forward_token`` call without changing its hot path.
 
-def build_litespark_cpu(model_path=MODEL_PATH, *, threads=4, cache_root=None, verbose=True):
+        The temporary wrappers keep the production implementation above as the
+        code under test. Timings are exclusive: the tied vocabulary projection
+        is charged to embedding/LM-head rather than to transformer-body GEMV.
+        Packed int4 weights are unpacked inside the GEMV kernel, so there is no
+        separate weight depacking pass to time.
+        """
+        categories = (
+            "ternary/int4 GEMV",
+            "activation quantization",
+            "embedding / LM head",
+            "attention",
+            "RMSNorm",
+            "packing/depacking",
+        )
+        timings = {name: 0.0 for name in categories}
+        counts = {name: 0 for name in categories}
+
+        def measured(name, operation, *args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return operation(*args, **kwargs)
+            finally:
+                timings[name] += time.perf_counter() - started
+                counts[name] += 1
+
+        original_embedding = self._embedding_into
+        original_projection = self._projection
+        original_qk_norm = self._qk_norm
+        original_attention = self._attention
+        original_kernel = self.kernel
+
+        def embedding(token, out):
+            return measured("embedding / LM head", original_embedding, token, out)
+
+        def projection(projection_, values, quantized, activation_scale, out):
+            name = "embedding / LM head" if projection_ is self.lm_head else "ternary/int4 GEMV"
+            return measured(
+                name, original_projection, projection_, values, quantized,
+                activation_scale, out,
+            )
+
+        def qk_norm(values, gamma):
+            return measured("RMSNorm", original_qk_norm, values, gamma)
+
+        def attention_(decode_state, layer_index):
+            return measured("attention", original_attention, decode_state, layer_index)
+
+        class ProfiledKernel:
+            def __getattr__(_self, name):
+                return getattr(original_kernel, name)
+
+            def rmsnorm_into(_self, *args, **kwargs):
+                return measured(
+                    "RMSNorm", original_kernel.rmsnorm_into, *args, **kwargs,
+                )
+
+            def quantize_activation(_self, *args, **kwargs):
+                return measured(
+                    "activation quantization",
+                    original_kernel.quantize_activation,
+                    *args, **kwargs,
+                )
+
+        self._embedding_into = embedding
+        self._projection = projection
+        self._qk_norm = qk_norm
+        self._attention = attention_
+        self.kernel = ProfiledKernel()
+        try:
+            started = time.perf_counter()
+            logits = self.forward_token(token_id, state)
+            total = time.perf_counter() - started
+        finally:
+            self._embedding_into = original_embedding
+            self._projection = original_projection
+            self._qk_norm = original_qk_norm
+            self._attention = original_attention
+            self.kernel = original_kernel
+        return logits, timings, counts, total
+
+
+def build_litespark_cpu(
+    model_path=MODEL_PATH, *, threads=4, cache_root=None, verbose=True,
+    gemv_layout="int4", gemv_kernel="prefetch1024",
+):
     """Load this Qwen3 LATTICE checkpoint into a torch-free LiteSpark runtime."""
+    if gemv_layout not in ("int4", "int8"):
+        raise ValueError("gemv_layout must be int4 or int8")
     configure_threads(threads)
     from MLX.lattice_model import load_checkpoint
     from litespark_inference.torchless import kernel
@@ -452,6 +584,17 @@ def build_litespark_cpu(model_path=MODEL_PATH, *, threads=4, cache_root=None, ve
                 print("  Converting tied embedding/lm_head to int4", flush=True)
             _convert_embedding(_array(state["model.embed_tokens.weight"]), embed_path, embed_scale_path)
 
+        def expand_int4(weights: np.ndarray) -> np.ndarray:
+            expanded = np.empty(
+                (weights.shape[0], weights.shape[1] * 2), dtype=np.int8,
+            )
+            for start in range(0, weights.shape[0], 256):
+                stop = min(weights.shape[0], start + 256)
+                block = weights[start:stop].astype(np.int8)
+                expanded[start:stop, 0::2] = (block << 4) >> 4
+                expanded[start:stop, 1::2] = block >> 4
+            return expanded
+
         def projection(name: str) -> LiteSparkProjection:
             files = manifest["projections"][name]
             weights = np.load(directory / files["weights"], allow_pickle=False)
@@ -459,7 +602,9 @@ def build_litespark_cpu(model_path=MODEL_PATH, *, threads=4, cache_root=None, ve
             expected = tuple(map(int, state[name + ".weight"]["shape"]))
             if weights.shape != (expected[0], expected[1] // 2) or scales.shape != (expected[0],):
                 raise ValueError(f"invalid LiteSpark cache shape for {name}")
-            return LiteSparkProjection(weights, scales)
+            if gemv_layout == "int8":
+                weights = expand_int4(weights)
+            return LiteSparkProjection(weights, scales, gemv_layout)
 
         def combine(*projections: LiteSparkProjection) -> LiteSparkProjection:
             if len({item.input_size for item in projections}) != 1:
@@ -467,6 +612,7 @@ def build_litespark_cpu(model_path=MODEL_PATH, *, threads=4, cache_root=None, ve
             return LiteSparkProjection(
                 np.concatenate([item.weights for item in projections], axis=0),
                 np.concatenate([item.scales for item in projections]),
+                projections[0].layout,
             )
 
         layers = []
@@ -494,14 +640,16 @@ def build_litespark_cpu(model_path=MODEL_PATH, *, threads=4, cache_root=None, ve
         embedding_scales = np.load(embed_scale_path, allow_pickle=False)
         final_norm = np.array(_array(state["model.norm.weight"]), dtype=np.float32, copy=True)
         model = LiteSparkQwen(
-            config, layers, embedding_packed, embedding_scales, final_norm, kernel
+            config, layers, embedding_packed, embedding_scales, final_norm,
+            kernel, gemv_kernel,
         )
         manifest["complete"] = True
         _atomic_json(manifest_path, manifest)
         if verbose:
             print(
                 f"LiteSpark Qwen ready: {platform.machine()}, "
-                f"{kernel.max_threads()} OpenMP threads, no PyTorch",
+                f"{kernel.max_threads()} OpenMP threads, "
+                f"{gemv_layout} body GEMV ({gemv_kernel}), no PyTorch",
                 flush=True,
             )
         return model
@@ -520,6 +668,35 @@ def _input_tokens(prompt: str, raw: bool) -> tuple[list[int], object]:
     return tokenizer.encode(text, add_special_tokens=False).ids, tokenizer
 
 
+def sample_logits(
+    logits: np.ndarray, generated: list[int], args, generator: np.random.Generator,
+) -> int:
+    """Sample one token with the standalone CPU runner's configured policy."""
+    if args.argmax:
+        return int(np.asarray(logits).argmax())
+    values = np.array(logits, dtype=np.float32, copy=True).reshape(-1)
+    if generated and args.repetition_penalty != 1.0:
+        ids = np.array(sorted(set(generated)), dtype=np.int64)
+        repeated = values[ids]
+        values[ids] = np.where(
+            repeated > 0,
+            repeated / np.float32(args.repetition_penalty),
+            repeated * np.float32(args.repetition_penalty),
+        )
+    values /= np.float32(args.temperature)
+    count = min(args.top_k, values.size)
+    ids = np.argpartition(-values, count - 1)[:count]
+    ids = ids[np.argsort(-values[ids])]
+    selected = values[ids]
+    selected -= selected.max()
+    probabilities = np.exp(selected, dtype=np.float32)
+    probabilities /= probabilities.sum(dtype=np.float32)
+    if args.top_p < 1.0:
+        probabilities[(np.cumsum(probabilities) - probabilities) >= args.top_p] = 0
+        probabilities /= probabilities.sum(dtype=np.float32)
+    return int(generator.choice(ids, p=probabilities))
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", required=True)
@@ -527,11 +704,43 @@ def parse_args(argv=None):
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--warmup-tokens", type=int, default=8)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top-k", type=int, default=40)
+    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--repetition-penalty", type=float, default=1.08)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--argmax", action="store_true",
+        help="use deterministic greedy decoding instead of sampling",
+    )
+    parser.add_argument(
+        "--gemv-layout", choices=("int4", "int8"), default="int4",
+        help="body-weight layout for the Apple SDOT A/B (default: int4)",
+    )
+    parser.add_argument(
+        "--gemv-kernel",
+        choices=("none", "prefetch256", "prefetch512", "prefetch1024"),
+        default="prefetch1024",
+        help="packed-int4 prefetch variant (default: prefetch1024)",
+    )
+    parser.add_argument(
+        "--profile-token", action="store_true",
+        help="profile one CPU decode token after --warmup-tokens warmup steps",
+    )
     parser.add_argument("--model", type=Path, default=MODEL_PATH)
     parser.add_argument("--cache", type=Path)
     args = parser.parse_args(argv)
-    if args.threads < 1 or args.max_new_tokens < 1 or args.warmup_tokens < 0:
-        parser.error("threads and max-new-tokens must be positive; warmup must be nonnegative")
+    if (args.threads < 1 or args.max_new_tokens < 1 or args.warmup_tokens < 0
+            or not math.isfinite(args.temperature) or args.temperature <= 0
+            or args.top_k < 1 or not math.isfinite(args.top_p)
+            or not 0 < args.top_p <= 1
+            or not math.isfinite(args.repetition_penalty)
+            or args.repetition_penalty < 1):
+        parser.error(
+            "threads, token counts, temperature, and top-k must be positive; "
+            "warmup must be nonnegative; top-p must be in (0,1]; "
+            "repetition-penalty must be >=1"
+        )
     return args
 
 
@@ -540,23 +749,93 @@ def main(argv=None) -> int:
     from tokenizers.decoders import DecodeStream
 
     print("=" * 72)
-    print("RUNTIME: Qwen3-4B LATTICE -> LiteSpark CPU (packed int4 SIMD)")
-    print(f"threads={args.threads}; model={args.model.name}")
+    print(
+        "RUNTIME: Qwen3-4B LATTICE -> LiteSpark CPU "
+        f"({args.gemv_layout} SIMD)"
+    )
+    policy = "argmax" if args.argmax else (
+        f"temperature={args.temperature:g}, top_k={args.top_k}, "
+        f"top_p={args.top_p:g}, repetition_penalty={args.repetition_penalty:g}"
+    )
+    print(
+        f"threads={args.threads}; model={args.model.name}; "
+        f"body_gemv={args.gemv_layout}/{args.gemv_kernel}; sampling={policy}"
+    )
     print("=" * 72, flush=True)
     started = time.perf_counter()
-    model = build_litespark_cpu(args.model, threads=args.threads, cache_root=args.cache)
+    model = build_litespark_cpu(
+        args.model, threads=args.threads, cache_root=args.cache,
+        gemv_layout=args.gemv_layout, gemv_kernel=args.gemv_kernel,
+    )
     print(f"Ready in {time.perf_counter() - started:.1f}s", flush=True)
 
     tokens, tokenizer = _input_tokens(args.prompt, args.raw_prompt)
     stop_ids = {tokenizer.token_to_id("<|endoftext|>"), tokenizer.token_to_id("<|im_end|>")}
     decoder = DecodeStream(skip_special_tokens=True)
     generated, decode_times = [], []
-    state = model.new_state(len(tokens) + args.max_new_tokens)
+    generator = np.random.default_rng(args.seed)
+    profile_steps = args.warmup_tokens + 1 if args.profile_token else 0
+    state = model.new_state(len(tokens) + max(args.max_new_tokens, profile_steps))
     started = time.perf_counter()
     for token_id in tokens:
         logits = model.forward_token(token_id, state)
     prefill_seconds = time.perf_counter() - started
-    token = int(logits.argmax())
+    token = sample_logits(logits, generated, args, generator)
+    if args.profile_token:
+        for _ in range(args.warmup_tokens):
+            generated.append(token)
+            logits = model.forward_token(token, state)
+            token = sample_logits(logits, generated, args, generator)
+
+        profiled_position = state.position
+        generated.append(token)
+        logits, timings, counts, model_seconds = model.profile_forward_token(
+            token, state,
+        )
+        started = time.perf_counter()
+        token = sample_logits(logits, generated, args, generator)
+        sampling_seconds = time.perf_counter() - started
+        timings["sampling"] = sampling_seconds
+        counts["sampling"] = 1
+        total = model_seconds + sampling_seconds
+        accounted = sum(timings.values())
+        timings["other"] = max(0.0, total - accounted)
+        counts["other"] = 0
+
+        print("\n--- ONE WARMED CPU DECODE TOKEN ---")
+        print(f"context position: {profiled_position} tokens")
+        for name in (
+            "ternary/int4 GEMV",
+            "activation quantization",
+            "embedding / LM head",
+            "attention",
+            "RMSNorm",
+            "sampling",
+            "packing/depacking",
+            "other",
+        ):
+            seconds = timings[name]
+            percent = 100.0 * seconds / total if total else 0.0
+            print(f"{name:26s} {seconds * 1000:8.3f} ms  {percent:5.1f}%")
+        print(f"{'total':26s} {total * 1000:8.3f} ms  100.0%")
+        print(f"instrumented throughput: {1.0 / total:.2f} tok/s")
+        print(
+            "calls: "
+            f"body GEMV={counts['ternary/int4 GEMV']}, "
+            f"activation quant={counts['activation quantization']}, "
+            f"attention={counts['attention']}, RMSNorm={counts['RMSNorm']}, "
+            f"embedding/head={counts['embedding / LM head']}"
+        )
+        print(
+            "packing/depacking: no standalone hot-path pass; int4 nibbles are "
+            "unpacked inside GEMV, and embedding-row unpack is included in "
+            "embedding / LM head."
+        )
+        print(
+            "other: RoPE, KV-cache writes, residuals, SiLU, Python dispatch, "
+            "and profiling overhead. Use a normal run for production tok/s."
+        )
+        return 0
     print("\n--- OUTPUT (streaming) ---", flush=True)
     for _ in range(args.max_new_tokens):
         if token in stop_ids:
@@ -572,7 +851,7 @@ def main(argv=None) -> int:
         elapsed = time.perf_counter() - started
         if len(generated) > args.warmup_tokens:
             decode_times.append(elapsed)
-        token = int(logits.argmax())
+        token = sample_logits(logits, generated, args, generator)
 
     print("\n--------------")
     print(f"runtime: litespark cpu ({platform.machine()})")

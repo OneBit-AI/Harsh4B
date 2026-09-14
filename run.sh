@@ -7,9 +7,14 @@ if [[ $# -lt 1 ]]; then
 fi
 
 repo_dir="$(cd "$(dirname "$0")" && pwd)"
-exec "$repo_dir/.venv-mlx/bin/python" -B "$repo_dir/test.py" \
-  --runtime cpu \
-  --cpu-threads 8 \
+python="$repo_dir/.venv/bin/python"
+if [[ ! -x "$python" ]]; then
+  echo 'Missing .venv. Follow the setup commands in README.md first.' >&2
+  exit 2
+fi
+
+exec "$python" -B "$repo_dir/cpu_lightspark.py" \
+  --threads 8 \
   --prompt "$*" \
-  --max-new-tokens 64 \
-  --warmup-tokens 8
+  --max-new-tokens 256 \
+  --warmup-tokens 6
