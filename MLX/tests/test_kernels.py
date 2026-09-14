@@ -89,6 +89,14 @@ def test_compact_lattice_against_dense_t1():
     np.testing.assert_allclose(np.array(actual), np.array(expected), atol=0.002, rtol=0.002)
     np.testing.assert_allclose(np.array(compact.dense_weight()), np.array(dense.dense_weight()), atol=1e-6)
 
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("single-token decode entered the dense/reference path")
+
+    for layer in (dense, compact):
+        layer.reference = forbidden
+        layer.dense_weight = forbidden
+        mx.eval(layer(x))
+
 
 def test_packing_is_lossless():
     signs = np.random.default_rng(8).integers(-1, 2, (13, 73), dtype=np.int8)

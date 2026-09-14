@@ -68,7 +68,19 @@ Text passed with `--prompt` is wrapped in Qwen3's thinking-disabled chat format.
 
 `--max-new-tokens` is a hard output ceiling. If it is reached before Qwen emits an end-of-turn token, the runner reports that the output may be truncated. Increase it when testing longer answers.
 
-The runner prints model startup time, prefill throughput, median decode throughput, mean seconds per token, stop reason, and peak MLX memory where applicable.
+The runner prints model startup time, prefill throughput, average decode
+throughput, stop reason, and peak MLX memory where applicable.
+
+Profile one warmed single-token Metal decode with fail-fast guards against the
+dense/reference projection path:
+
+```bash
+python test.py --runtime mlx --profile-token --prompt "explain why water is cohesive"
+```
+
+The profile splits attention, packed custom GEMV, sampling, and remaining work.
+It also reports the number of packed projections and fails if decode invokes a
+separate full-weight dequantization or dense projection.
 
 ## Local Web UI
 
@@ -85,6 +97,14 @@ The server provides bounded chat history, asynchronous Server-Sent Events, cance
 ### MLX and Metal
 
 `MLX/kernels.py` implements packed two-bit ternary and affine LATTICE projections. SIMD lanes load adjacent packed bytes, accumulate in FP32, and reduce once per output row. Decode uses packed custom Metal kernels; multi-token prefill uses the reference matrix path. Growing KV-cache capacity buckets avoid reallocating the complete cache on every token.
+
+Single-token decode reconstructs each affine weight from its packed codes and
+FP16 scale table inside the custom GEMV kernel. The default loader expands the
+checkpoint's compact T1 stream once into a dense *two-bit packed* layout; it
+does not create dense floating-point weights. Multi-token prefill is different:
+it currently launches a dequantization kernel and then a dense matrix multiply.
+KOTMS activation rotations and the tied dense vocabulary head also remain
+outside the packed projection kernel.
 
 The checkpoint reader maps uncompressed `torch.save` ZIP members directly and closes each backing file descriptor immediately after creating its mapping. This keeps the 3.96 GiB checkpoint file-backed without exhausting macOS's per-process open-file limit.
 

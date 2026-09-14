@@ -63,6 +63,8 @@ def parse_args():
     parser.add_argument("--repetition-penalty", type=float, default=1.15)
     parser.add_argument("--seed", type=int, default=0,
                         help="Sampling seed for repeatable benchmark output (default: %(default)s)")
+    parser.add_argument("--profile-token", action="store_true",
+                        help="Profile one warmed MLX decode token by operation category")
     parser.add_argument("--compact-t1", action="store_true",
                         help="Use checkpoint-native compact T1 to reduce memory at lower decode speed")
     parser.add_argument("--cpu-threads", type=int, default=4)
@@ -155,6 +157,100 @@ def sample_mlx(mx, logits, generated, args):
     return int(ids[mx.random.categorical(selected)])
 
 
+def profile_mlx_token(mx, model, cache, token, position):
+    """Replay one token's real inputs to time packed GEMV and attention.
+
+    The recording pass materializes realistic inputs without charging its many
+    synchronization points to the result. Each category is then replayed with
+    one synchronization. Dense/reference methods are fail-fast guarded.
+    """
+    projection_jobs = []
+    attention_jobs = []
+    projection_count = 0
+
+    def materialize(operation):
+        result = operation()
+        if isinstance(result, tuple):
+            mx.eval(*result)
+        else:
+            mx.eval(result)
+        return result
+
+    def forbidden_dense_path(*_args, **_kwargs):
+        raise RuntimeError("decode attempted separate dequantization/dense matmul")
+
+    guarded = []
+    for layer in model.layers:
+        for name in ("q", "k", "v", "o", "gate", "up", "down"):
+            linear = layer[name].linear
+            guarded.append((linear, linear.reference, linear.dense_weight))
+            linear.reference = forbidden_dense_path
+            linear.dense_weight = forbidden_dense_path
+
+    def project(projection, value):
+        nonlocal projection_count
+        shape = value.shape
+        rotated = materialize(
+            lambda: (
+                projection.left
+                @ value.reshape(-1, projection.left.shape[0], projection.right.shape[0]).astype(mx.float16)
+                @ projection.right
+            ).reshape(-1, projection.in_features),
+        )
+        if rotated.size != projection.in_features:
+            raise RuntimeError("decode projection is not a single activation vector")
+        projection_jobs.append((projection.linear, rotated))
+        result = materialize(lambda: projection.linear(rotated))
+        projection_count += 1
+        return result.reshape(*shape[:-1], projection.out_features)
+
+    try:
+        x = materialize(lambda: model.embed[mx.array([[token]], dtype=mx.int32)])
+        rope_cos, rope_sin = materialize(lambda: rope_factors(mx, mx.array([position]), x.dtype))
+        for layer_index, layer in enumerate(model.layers):
+            residual = x
+            x = materialize(lambda: rms_norm(mx, x, layer["input_norm"]))
+            q = project(layer["q"], x).reshape(1, 1, 32, 128).transpose(0, 2, 1, 3)
+            k = project(layer["k"], x).reshape(1, 1, 8, 128).transpose(0, 2, 1, 3)
+            v = project(layer["v"], x).reshape(1, 1, 8, 128).transpose(0, 2, 1, 3)
+            q = materialize(lambda: rms_norm(mx, q, layer["q_norm"]))
+            k = materialize(lambda: rms_norm(mx, k, layer["k_norm"]))
+            q = materialize(lambda: apply_rope(mx, q, rope_cos, rope_sin))
+            k = materialize(lambda: apply_rope(mx, k, rope_cos, rope_sin))
+            k, v = materialize(lambda: cache.append(layer_index, k, v))
+            attention_jobs.append((q, k, v))
+            attended = materialize(lambda: attention(mx, q, k, v))
+            attended = attended.transpose(0, 2, 1, 3).reshape(1, 1, layer["o"].in_features)
+            projected = project(layer["o"], attended)
+            x = materialize(lambda: residual + projected)
+            residual = x
+            normalized = materialize(lambda: rms_norm(mx, x, layer["post_norm"]))
+            gate = project(layer["gate"], normalized)
+            up = project(layer["up"], normalized)
+            activated = materialize(lambda: (gate * mx.sigmoid(gate)) * up)
+            down = project(layer["down"], activated)
+            x = materialize(lambda: residual + down)
+        materialize(lambda: rms_norm(mx, x, model.final_norm) @ model.lm_head.T)
+
+        started = time.perf_counter()
+        projection_outputs = [linear(value) for linear, value in projection_jobs]
+        mx.eval(*projection_outputs)
+        gemv_seconds = time.perf_counter() - started
+
+        started = time.perf_counter()
+        attention_outputs = [attention(mx, q, k, v) for q, k, v in attention_jobs]
+        mx.eval(*attention_outputs)
+        attention_seconds = time.perf_counter() - started
+    finally:
+        for linear, reference, dense_weight in guarded:
+            linear.reference = reference
+            linear.dense_weight = dense_weight
+
+    if projection_count != 252:
+        raise RuntimeError(f"expected 252 packed decode projections, observed {projection_count}")
+    return gemv_seconds, attention_seconds, projection_count
+
+
 def run_cpu(args, tokens, tokenizer):
     """Run generation through the repository's native PyTorch CPU model."""
     try:
@@ -241,6 +337,8 @@ def main():
             "temperature must be 0-2, top-p must be in (0,1], and repetition-penalty must be >=1"
         )
     print_runtime_banner(args)
+    if args.profile_token and args.runtime != "mlx":
+        raise SystemExit("--profile-token currently profiles the MLX/Metal decode path")
     if not MODEL_PATH.is_file():
         raise SystemExit(f"Missing required checkpoint: {MODEL_PATH}")
     tokens, tokenizer = input_tokens(args)
@@ -281,6 +379,43 @@ def main():
     stop_ids = generation_stop_ids(tokenizer)
     mx.random.seed(args.seed)
     token = sample_mlx(mx, logits[0, -1], generated, args)
+    if args.profile_token:
+        # Compile and warm every single-token kernel first.
+        generated.append(token)
+        logits = model(mx.array([[token]], dtype=mx.int32), cache, len(tokens))
+        mx.eval(logits)
+        token = sample_mlx(mx, logits[0, -1], generated, args)
+
+        # Time one ordinary production decode without internal barriers.
+        generated.append(token)
+        started = time.perf_counter()
+        logits = model(mx.array([[token]], dtype=mx.int32), cache, len(tokens) + 1)
+        mx.eval(logits)
+        model_seconds = time.perf_counter() - started
+        started = time.perf_counter()
+        token = sample_mlx(mx, logits[0, -1], generated, args)
+        sampling_seconds = time.perf_counter() - started
+        generated.append(token)
+
+        gemv_seconds, attention_seconds, projection_count = profile_mlx_token(
+            mx, model, cache, token, len(tokens) + 2
+        )
+        total = model_seconds + sampling_seconds
+        timings = {
+            "attention": attention_seconds,
+            "packed linear / GEMV": gemv_seconds,
+            "dequant/unpack": 0.0,
+            "sampling": sampling_seconds,
+            "everything else": total - gemv_seconds - attention_seconds - sampling_seconds,
+        }
+        print("\n--- ONE GENERATED TOKEN ---")
+        for category, seconds in timings.items():
+            percent = 100 * seconds / total if total else 0.0
+            print(f"{category}: {seconds * 1000:.3f} ms ({percent:.1f}%)")
+        print(f"total: {total * 1000:.3f} ms ({1 / total:.2f} tok/s)")
+        print(f"decode path: {projection_count}/252 packed custom Metal GEMVs")
+        print("dense/reference decode calls: 0 (fail-fast guard verified)")
+        return
     for _ in range(args.max_new_tokens):
         if token in stop_ids:
             break
