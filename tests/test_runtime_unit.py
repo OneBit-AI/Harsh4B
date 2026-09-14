@@ -32,6 +32,16 @@ def test_auto_apple_silicon_does_not_import_torch(monkeypatch):
     assert rt.select_runtime("cpu") == "cpu"
 
 
+def test_auto_apple_silicon_prefers_litespark_cpu(monkeypatch):
+    monkeypatch.setattr(rt.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(rt.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(
+        importlib.util, "find_spec",
+        lambda name: object() if name in {"mlx", "litespark_inference"} else None,
+    )
+    assert rt.select_runtime() == "cpu"
+
+
 @pytest.fixture
 def tokenizer():
     return rt.ChatTokenizer(rt.ROOT / "tokenizer.json")

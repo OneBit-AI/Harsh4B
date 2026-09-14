@@ -8,7 +8,7 @@
 #   Linux CUDA  -> base + cpu + cuda + test  (mlx is skipped: macOS-only)
 #
 # Runtimes in this repo:
-#   cpu  -> build_cpu_model.py, inference_runtime.TorchRuntime(device="cpu"),
+#   cpu  -> cpu_lightspark.py, inference_runtime.LiteSparkRuntime,
 #           test.py --runtime cpu, web_ui.py --runtime cpu
 #   cuda -> inference_runtime.TorchRuntime(device="cuda") [bucketed graphs],
 #           gemv_triton_v4.py, packed_linear.py, benchmarks/bench_*.py
@@ -34,11 +34,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# PyTorch CPU runtime (Apple Silicon / Linux CPU). Pins verified in .venv-cpu.
+# Torch-free LiteSpark CPU runtime (native NEON/VNNI kernels).
 cpu = [
-    "torch==2.14.0",        # model build, prefill/decode, sampling
-    "transformers==4.57.6", # Qwen3 config + AutoModelForCausalLM shell
-    "accelerate==1.15.0",   # init_empty_weights for meta-device assembly
+    "litespark-inference==1.0.3", # Torchless BitNet + native NEON/VNNI kernels
 ]
 # NVIDIA CUDA runtime (Linux only). Same torch pin: PyPI ships CUDA wheels
 # for it by default; the CPU wheel is selected automatically on macOS.
@@ -60,6 +58,7 @@ test = [
 ]
 # Everything, everywhere, one command: pip install -e ".[all]"
 all = [
+    "litespark-inference==1.0.3",
     "torch==2.14.0",
     "transformers==4.57.6",
     "accelerate==1.15.0",
@@ -87,6 +86,7 @@ include = ["MLX*"]
 py-modules = [
     "build_cpu_model",
     "packed_cpu",
+    "cpu_lightspark",
     "inference_runtime",
     "packed_linear",
     "gemv_triton_v4",

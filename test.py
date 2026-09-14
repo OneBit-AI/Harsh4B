@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and benchmark model.lat.pt with MLX/Metal or the CPU runtime.
+"""Run and benchmark model.lat.pt with LiteSpark/CPU or MLX/Metal.
 
 The MLX path reads the PyTorch checkpoint's tensor storages directly, so
 PyTorch is not a dependency for that path.  ``model.lat.pt`` is the only
@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument("--tokenizer", type=Path, default=TOKENIZER_PATH,
                         help="Qwen3 tokenizer.json (default: %(default)s)")
     parser.add_argument("--runtime", choices=("mlx", "cpu"), default="cpu",
-                        help="Inference runtime: PyTorch CPU (default) or MLX/Metal")
+                        help="Inference runtime: LiteSpark CPU (default) or MLX/Metal")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--warmup-tokens", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.7,
@@ -70,7 +70,7 @@ def parse_args():
     parser.add_argument("--cpu-threads", type=int, default=4)
     parser.add_argument("--cpu-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--cpu-layout", choices=("auto", "packed", "absorbed"), default="auto",
-                        help="auto uses packed CPU kernels on macOS; absorbed uses dense mmap weights")
+                        help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -78,7 +78,7 @@ def print_runtime_banner(args):
     """Make the active backend and the command for switching unmistakable."""
     print("=" * 72, flush=True)
     if args.runtime == "cpu":
-        print("RUNTIME: CPU (default) — PyTorch CPU inference", flush=True)
+        print("RUNTIME: CPU (default) — LiteSpark packed int4 SIMD", flush=True)
         print("MLX/Metal is NOT used in this run.", flush=True)
         print("To switch to MLX:", flush=True)
         print("  .venv-mlx/bin/python test.py --runtime mlx --prompt \"your prompt\"", flush=True)
@@ -155,6 +155,31 @@ def sample_mlx(mx, logits, generated, args):
     if args.top_p < 1.0:
         selected = mx.where(mx.cumsum(probabilities) - probabilities >= args.top_p, -mx.inf, selected)
     return int(ids[mx.random.categorical(selected)])
+
+
+def sample_numpy(logits, generated, args, generator):
+    values = np.array(logits, dtype=np.float32, copy=True).reshape(-1)
+    if generated and args.repetition_penalty != 1.0:
+        ids = np.array(sorted(set(generated)), dtype=np.int64)
+        repeated = values[ids]
+        values[ids] = np.where(
+            repeated > 0, repeated / args.repetition_penalty,
+            repeated * args.repetition_penalty,
+        )
+    if args.temperature <= 0.01:
+        return int(values.argmax())
+    values /= np.float32(args.temperature)
+    count = min(args.top_k, values.size)
+    ids = np.argpartition(-values, count - 1)[:count]
+    ids = ids[np.argsort(-values[ids])]
+    selected = values[ids]
+    selected -= selected.max()
+    probabilities = np.exp(selected, dtype=np.float32)
+    probabilities /= probabilities.sum(dtype=np.float32)
+    if args.top_p < 1.0:
+        probabilities[(np.cumsum(probabilities) - probabilities) >= args.top_p] = 0
+        probabilities /= probabilities.sum(dtype=np.float32)
+    return int(generator.choice(ids, p=probabilities))
 
 
 def profile_mlx_token(mx, model, cache, token, position):
@@ -252,71 +277,52 @@ def profile_mlx_token(mx, model, cache, token, position):
 
 
 def run_cpu(args, tokens, tokenizer):
-    """Run generation through the repository's native PyTorch CPU model."""
+    """Run generation through the torch-free LiteSpark CPU model."""
     try:
-        import torch
-        from build_cpu_model import build_cpu
+        from cpu_lightspark import build_litespark_cpu
     except ImportError as exc:
         raise SystemExit(
-            "The CPU runtime requires PyTorch and transformers; "
-            "install the CPU runtime dependencies first."
+            "The CPU runtime requires litespark-inference; install the CPU dependencies first."
         ) from exc
 
-    print("[CPU] Loading the model with the PyTorch CPU runtime...", flush=True)
+    print("[CPU] Loading this repository's LATTICE model with LiteSpark...", flush=True)
     started = time.perf_counter()
-    import platform
-    packed_cpu = args.cpu_layout == "packed" or (args.cpu_layout == "auto" and platform.system() == "Darwin")
-    layout = "packed native kernels" if packed_cpu else "absorbed dense mmap weights"
-    print(f"[CPU] Layout: {layout}; dtype={args.cpu_dtype}; threads={args.cpu_threads}", flush=True)
-    if packed_cpu:
-        from packed_cpu import build_packed_cpu
-        model = build_packed_cpu(MODEL_PATH, dtype=getattr(torch, args.cpu_dtype), threads=args.cpu_threads)
-    else:
-        model = build_cpu(packed_path=str(MODEL_PATH), rot_path=str(CPU_ROT_PATH),
-                          cache_path=CPU_CACHE_PATH, verbose=True,
-                          dtype=getattr(torch, args.cpu_dtype), threads=args.cpu_threads)
+    print(f"[CPU] Layout: lattice-unpacked int4; threads={args.cpu_threads}", flush=True)
+    model = build_litespark_cpu(MODEL_PATH, threads=args.cpu_threads)
     print(f"[CPU] Model ready in {time.perf_counter() - started:.1f}s", flush=True)
-    torch.manual_seed(args.seed)
 
-    input_ids = torch.tensor([tokens], dtype=torch.long)
     generated, decode_times = [], []
     stop_ids = generation_stop_ids(tokenizer)
     from tokenizers.decoders import DecodeStream
     decoder = DecodeStream(skip_special_tokens=True) if tokenizer else None
-    with torch.inference_mode():
-        print(f"[CPU] Prefilling {len(tokens)} prompt tokens; generation has started...", flush=True)
-        started = time.perf_counter()
-        past = None
-        chunk = 8 if packed_cpu else len(tokens)
-        for start in range(0, len(tokens), chunk):
-            outputs = model(input_ids=input_ids[:, start:start+chunk], past_key_values=past,
-                            use_cache=True, logits_to_keep=1)
-            past = outputs.past_key_values
-        prefill_seconds = time.perf_counter() - started
-        past_key_values = outputs.past_key_values
-        token = sample_torch(torch, outputs.logits[:, -1], generated, args)
-        print(f"[CPU] First token ready in {prefill_seconds:.3f}s\n\n--- OUTPUT (streaming) ---", flush=True)
+    generator = np.random.default_rng(args.seed)
+    state = model.new_state(len(tokens) + args.max_new_tokens)
+    print(f"[CPU] Prefilling {len(tokens)} prompt tokens; generation has started...", flush=True)
+    started = time.perf_counter()
+    for token_id in tokens:
+        logits = model.forward_token(token_id, state)
+    prefill_seconds = time.perf_counter() - started
+    token = sample_numpy(logits, generated, args, generator)
+    print(f"[CPU] First token ready in {prefill_seconds:.3f}s\n\n--- OUTPUT (streaming) ---", flush=True)
 
-        for _ in range(args.max_new_tokens):
-            if token in stop_ids:
-                break
-            generated.append(token)
-            piece = decoder.step(tokenizer, token) if decoder else f"{token},"
-            if piece:
-                print(piece, end="", flush=True)
-            if len(generated) >= args.max_new_tokens:
-                break
-            next_input = torch.tensor([[token]], dtype=torch.long)
-            started = time.perf_counter()
-            outputs = model(input_ids=next_input, past_key_values=past_key_values, use_cache=True, logits_to_keep=1)
-            decode_times.append(time.perf_counter() - started)
-            past_key_values = outputs.past_key_values
-            token = sample_torch(torch, outputs.logits[:, -1], generated, args)
+    for _ in range(args.max_new_tokens):
+        if token in stop_ids:
+            break
+        generated.append(token)
+        piece = decoder.step(tokenizer, token) if decoder else f"{token},"
+        if piece:
+            print(piece, end="", flush=True)
+        if len(generated) >= args.max_new_tokens:
+            break
+        started = time.perf_counter()
+        logits = model.forward_token(token, state)
+        decode_times.append(time.perf_counter() - started)
+        token = sample_numpy(logits, generated, args, generator)
 
     measured = decode_times[min(args.warmup_tokens, len(decode_times)):]
     print("\n--------------")
     print(f"model: {MODEL_PATH.name}")
-    print(f"runtime: cpu (PyTorch, {layout})")
+    print("runtime: cpu (LiteSpark packed int4 SIMD)")
     print(f"stop: {'end-of-turn token' if token in stop_ids else f'{args.max_new_tokens}-token limit (output may be truncated)'}")
     print(f"prefill: {len(tokens)} tokens in {prefill_seconds:.3f}s ({len(tokens) / prefill_seconds:.2f} tok/s)")
     if measured:

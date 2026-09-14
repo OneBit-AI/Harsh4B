@@ -1,6 +1,6 @@
 # OneBit AI: Qwen3-4B LATTICE
 
-Cross-platform inference for the Qwen3-4B-LATTICE W1.58A16 post-training ternary checkpoint. The repository provides a shared local chat UI and benchmark runner for CUDA/Triton, MLX/Metal on Apple Silicon, and native PyTorch CPU execution.
+Cross-platform inference for the Qwen3-4B-LATTICE W1.58A16 post-training ternary checkpoint. The repository provides a shared local chat UI and benchmark runner for CUDA/Triton, MLX/Metal on Apple Silicon, and torch-free LiteSpark CPU execution.
 
 ## Runtime overview
 
@@ -8,9 +8,9 @@ Cross-platform inference for the Qwen3-4B-LATTICE W1.58A16 post-training ternary
 | --- | --- | --- | --- |
 | MLX | Apple Silicon GPU via Metal | Packed LATTICE kernels | `--runtime mlx` |
 | CUDA | NVIDIA GPU | Triton packed kernels and bucketed CUDA graphs | `--runtime cuda` |
-| CPU | macOS or Linux CPU | Native packed kernels on macOS; absorbed mmap weights elsewhere | `--runtime cpu` |
+| CPU | macOS or Linux CPU | LATTICE converted once to packed per-row int4; NEON/AVX GEMV | `--runtime cpu` |
 
-`web_ui.py --runtime auto` selects MLX on Apple Silicon when available, then CUDA, and finally CPU. `test.py` defaults to CPU so benchmark results never silently use the GPU.
+`web_ui.py --runtime auto` prefers LiteSpark CPU on Apple Silicon, CUDA on supported NVIDIA hosts, and then the remaining available local backend. MLX remains available explicitly with `--runtime mlx`. `test.py` defaults to CPU so benchmark results never silently use the GPU.
 
 ## Installation
 
@@ -37,13 +37,13 @@ Place these model assets in the repository root:
 
 - `model.lat.pt`: packed Qwen3-4B-LATTICE checkpoint.
 - `tokenizer.json`: matching Qwen3 tokenizer.
-- `rot_4b_LR.pt`: required by the absorbed CPU and upstream CUDA paths when rotations are not embedded in the checkpoint.
+- `rot_4b_LR.pt`: required by the upstream CUDA path when rotations are not embedded in the checkpoint.
 
 The bundled `configs/qwen3-4b.json` allows CPU construction without downloading model configuration.
 
 ## Command-line inference
 
-CPU with native packed kernels on macOS:
+CPU with LiteSpark packed kernels:
 
 ```bash
 python test.py \
@@ -112,11 +112,11 @@ Floating-point reduction order differs from dense matrix multiplication. Fixture
 
 ### CPU
 
-macOS defaults to native C++ packed LATTICE kernels with compact T1 codes, bounded prefill scratch, mapped buffers, and embedded KOTMS rotations. The first run compiles `cpu_kernels/lattice.cpp` with Apple Clang and caches the dynamic library under `.cache/`.
+`cpu_lightspark.py` reads this repository's `model.lat.pt` directly without importing PyTorch. On the first run it reconstructs every affine LATTICE projection, absorbs the KOTMS rotations, requantizes each output row to signed int4, and writes a resumable cache under `.cache/litespark-lattice/`. This one-time conversion takes roughly two minutes and produces about 2 GiB of packed projection and tied-embedding data; later starts take well under a second when the files are cached by the OS.
 
-The alternative `--cpu-layout absorbed` path reconstructs rotated dense weights into source- and dtype-validated mmap shards. This uses substantially more resident storage and can page heavily on memory-constrained systems.
+Apple ARM64 decode uses `cpu_kernels/litespark_int4.cpp`: packed nibbles are unpacked only into NEON registers, multiplied by LiteSpark-quantized int8 activations with SDOT, and scaled directly into the output. Q/K/V and gate/up are concatenated to reduce OpenMP launch overhead. No dense weight or separate dequantization buffer is created per token. Other architectures fall back to LiteSpark's portable packed-int4 routine.
 
-Ternary packing lowers model storage and memory bandwidth, but the current CPU kernel still reconstructs affine weights while computing every projection. CPU execution is therefore slower than MLX/Metal despite using the LATTICE checkpoint.
+The int4 cache is a second quantization of the deployed LATTICE values, so it is not bit-identical to the MLX affine kernel. It retains the repository's Qwen architecture, checkpoint weights, tokenizer, norms, and tied head; fixture and end-to-end tests should be rerun when changing the conversion rule.
 
 ### CUDA
 
@@ -126,10 +126,10 @@ The CUDA path uses packed Triton GEMV kernels, vectorized sampling, and static c
 
 Recent end-to-end runs on an Apple M4 with 16 GiB unified memory produced:
 
-| Runtime | Configuration | Median decode |
+| Runtime | Configuration | Decode throughput |
 | --- | --- | ---: |
 | MLX/Metal | 64-token chat-formatted run | 15.73 tok/s |
-| Native CPU | 8 threads, packed LATTICE | 0.63 tok/s |
+| LiteSpark CPU | 8 threads, packed int4×int8 SDOT | 32.34 tok/s |
 | Absorbed CPU | dense mmap baseline | approximately 0.10 tok/s |
 
 The corrected MLX run generated a concise answer and stopped on Qwen's end-of-turn token. Performance varies with prompt length, thermals, memory pressure, model state, and OS scheduling; these numbers are measurements, not guarantees.
@@ -165,7 +165,7 @@ Inspect the JSONL reason and machine state before manually clearing a latch. MLX
 CPU and shared runtime tests:
 
 ```bash
-python -m pytest -q tests/test_runtime_unit.py tests/test_cpu_runtime.py
+python -m pytest -q tests/test_runtime_unit.py tests/test_cpu_lightspark.py tests/test_cpu_runtime.py
 ```
 
 MLX kernel, runner, and safety tests under supervision:

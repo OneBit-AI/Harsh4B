@@ -805,19 +805,16 @@ def run_server(argv=None):
     parser.add_argument("--runtime", choices=("auto", "cuda", "mlx", "cpu"), default="auto")
     parser.add_argument("--model", help="Packed LATTICE checkpoint (default: model.lat.pt or upstream filename)")
     parser.add_argument("--tokenizer", help="Local Qwen3 tokenizer.json")
-    parser.add_argument("--cpu-cache", help="Directory for reconstructed CPU weight shards")
     parser.add_argument("--cpu-threads", type=int, default=4)
-    parser.add_argument("--cpu-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
-    parser.add_argument("--cpu-layout", choices=("auto", "packed", "absorbed"), default="auto")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     args = parser.parse_args(argv)
     if args.cpu_threads < 1:
         parser.error("--cpu-threads must be positive")
     print(f"Loading runtime: {args.runtime}...", flush=True)
-    runtime = create_runtime(args.runtime, args.model, args.tokenizer,
-                             cpu_cache=args.cpu_cache, cpu_threads=args.cpu_threads, cpu_dtype=args.cpu_dtype,
-                             cpu_layout=args.cpu_layout)
+    runtime = create_runtime(
+        args.runtime, args.model, args.tokenizer, cpu_threads=args.cpu_threads
+    )
     server = InferenceServer((args.host, args.port), runtime)
     print(f"{runtime.description} on {runtime.hardware}", flush=True)
     print(f"Web UI ready at http://{args.host}:{server.server_port}", flush=True)

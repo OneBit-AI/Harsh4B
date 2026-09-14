@@ -17,6 +17,10 @@ def select_runtime(requested="auto"):
     if requested != "auto":
         return requested
     if platform.system() == "Darwin" and platform.machine() == "arm64":
+        # CPU is the preferred local path. Check it before importing torch:
+        # PyTorch's bundled libomp cannot share a process with LiteSpark's.
+        if importlib.util.find_spec("litespark_inference") is not None:
+            return "cpu"
         if importlib.util.find_spec("mlx") is not None:
             return "mlx"
     if importlib.util.find_spec("torch") is not None:
@@ -133,6 +137,56 @@ def sample_mlx(mx, logits, generated, temperature=0.7, top_p=0.9, top_k=50, rep_
     if top_p < 1.0:
         selected = mx.where(mx.cumsum(probs) - probs >= top_p, -mx.inf, selected)
     return int(ids[mx.random.categorical(selected)])
+
+
+def sample_numpy(np, logits, generated, temperature=0.7, top_p=0.9, top_k=50, rep_penalty=1.15):
+    values = np.array(logits, dtype=np.float32, copy=True).reshape(-1)
+    if generated and rep_penalty != 1.0:
+        ids = np.array(sorted(set(generated)), dtype=np.int64)
+        repeated = values[ids]
+        values[ids] = np.where(repeated > 0, repeated / rep_penalty, repeated * rep_penalty)
+    if temperature <= 0.01:
+        return int(values.argmax())
+    values /= np.float32(temperature)
+    count = min(top_k, values.size)
+    ids = np.argpartition(-values, count - 1)[:count]
+    ids = ids[np.argsort(-values[ids])]
+    selected = values[ids]
+    selected -= selected.max()
+    probabilities = np.exp(selected, dtype=np.float32)
+    probabilities /= probabilities.sum(dtype=np.float32)
+    if top_p < 1.0:
+        probabilities[(np.cumsum(probabilities) - probabilities) >= top_p] = 0
+        probabilities /= probabilities.sum(dtype=np.float32)
+    return int(np.random.choice(ids, p=probabilities))
+
+
+class LiteSparkRuntime(Runtime):
+    device = "cpu"
+    description = "CPU · LiteSpark packed int4 SIMD"
+
+    def __init__(self, path, tokenizer, cpu_threads=4, **_):
+        import numpy as np
+        from cpu_lightspark import build_litespark_cpu
+        self.np, self.tokenizer = np, tokenizer
+        self.model = build_litespark_cpu(path, threads=cpu_threads)
+        self.hardware = f"{platform.machine()} CPU ({cpu_threads} threads)"
+
+    def prefill(self, ids, max_tokens):
+        state = self.model.new_state(len(ids) + max_tokens)
+        for token in ids:
+            logits = self.model.forward_token(token, state)
+        return logits, state
+
+    def decode(self, token, session):
+        return self.model.forward_token(token, session)
+
+    def sample(self, logits, generated, temperature):
+        return sample_numpy(self.np, logits, generated, temperature)
+
+    def memory_gib(self):
+        import psutil
+        return psutil.Process().memory_info().rss / 2**30
 
 
 class MLXRuntime(Runtime):
@@ -296,5 +350,5 @@ def create_runtime(name="auto", model_path=None, tokenizer_path=None, **options)
     if not tokenizer_path.is_file():
         raise FileNotFoundError(f"Missing tokenizer: {tokenizer_path}; use --tokenizer PATH.")
     tokenizer = ChatTokenizer(tokenizer_path)
-    cls = MLXRuntime if selected == "mlx" else TorchRuntime
+    cls = MLXRuntime if selected == "mlx" else LiteSparkRuntime if selected == "cpu" else TorchRuntime
     return cls(checkpoint_path(model_path), tokenizer, device=selected, **options)
