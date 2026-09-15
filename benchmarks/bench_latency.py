@@ -39,6 +39,7 @@ from bench_energy import (  # noqa: E402
     percentile,
     timed_generate,
 )
+from cpu_lightspark import DEFAULT_CPU_THREADS  # noqa: E402
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -68,7 +69,7 @@ def parse_args():
                         help="untimed runs per grid cell (default: 1)")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="0 = greedy/deterministic (default)")
-    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument("--cpu-threads", type=int, default=DEFAULT_CPU_THREADS)
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--csv-out", type=Path, default=None)
     return parser.parse_args()

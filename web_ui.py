@@ -9,6 +9,7 @@ import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
+from cpu_lightspark import DEFAULT_CPU_THREADS
 from inference_runtime import create_runtime
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -805,7 +806,7 @@ def run_server(argv=None):
     parser.add_argument("--runtime", choices=("auto", "cuda", "mlx", "cpu"), default="auto")
     parser.add_argument("--model", help="Packed LATTICE checkpoint (default: model.lat.pt or upstream filename)")
     parser.add_argument("--tokenizer", help="Local Qwen3 tokenizer.json")
-    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument("--cpu-threads", type=int, default=DEFAULT_CPU_THREADS)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     args = parser.parse_args(argv)

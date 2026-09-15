@@ -31,6 +31,8 @@ TOKENIZER_PATH = ROOT / "tokenizer.json"
 CONFIG_PATH = ROOT / "configs/qwen3-4b.json"
 CACHE_VERSION = 2
 DEFAULT_SYSTEM = "You are a helpful assistant. Answer directly in one sentence of at most 30 words."
+DEFAULT_CPU_THREADS = 6
+DEFAULT_GEMV_KERNEL = "prefetch512"
 
 
 def configure_threads(threads: int) -> None:
@@ -78,7 +80,7 @@ def _native_kernel_function(symbol: str):
 
 
 @lru_cache(None)
-def _native_int4_kernel(variant="prefetch1024"):
+def _native_int4_kernel(variant=DEFAULT_GEMV_KERNEL):
     """Packed signed-int4 x int8 SDOT GEMV."""
     symbols = {
         "none": "litespark_int4_i8_gemv_nopf",
@@ -95,6 +97,18 @@ def _native_int4_kernel(variant="prefetch1024"):
 def _native_int8_kernel():
     """Expanded signed-int8 x int8 SDOT GEMV used for the paper-inspired A/B."""
     return _native_kernel_function("litespark_int8_i8_gemv")
+
+
+@lru_cache(None)
+def _native_attention_kernel():
+    """Fused single-token grouped-query attention for Apple ARM64."""
+    library = _native_kernel_library()
+    if library is None:
+        return None
+    function = library.litespark_gqa_decode
+    function.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 5
+    function.restype = None
+    return function
 
 
 def _array(value) -> np.ndarray:
@@ -300,7 +314,7 @@ class LiteSparkQwen:
 
     def __init__(
         self, config, layers, embedding, embedding_scales, final_norm, kernel,
-        gemv_kernel="prefetch1024",
+        gemv_kernel=DEFAULT_GEMV_KERNEL,
     ):
         self.config = config
         self.layers = layers
@@ -311,6 +325,7 @@ class LiteSparkQwen:
         self.kernel = kernel
         self.int4_kernel = _native_int4_kernel(gemv_kernel)
         self.int8_kernel = _native_int8_kernel()
+        self.attention_kernel = _native_attention_kernel()
         head_dim = int(config["head_dim"])
         positions = np.arange(int(config["max_position_embeddings"]), dtype=np.float32)[:, None]
         inv_freq = np.float32(1.0) / np.float32(config["rope_theta"]) ** (
@@ -376,6 +391,20 @@ class LiteSparkQwen:
         kv_heads = int(c["num_key_value_heads"])
         groups = int(c["num_attention_heads"]) // kv_heads
         end = state.position + 1
+        if self.attention_kernel is not None:
+            self.attention_kernel(
+                state.q.ctypes.data,
+                state.keys[layer_index].ctypes.data,
+                state.values[layer_index].ctypes.data,
+                state.scores.ctypes.data,
+                state.attended.ctypes.data,
+                end,
+                kv_heads,
+                groups,
+                int(c["head_dim"]),
+                state.capacity,
+            )
+            return
         q = state.q.reshape(kv_heads, groups, int(c["head_dim"]))
         scores = state.scores[:, :, :end]
         np.einsum(
@@ -525,8 +554,8 @@ class LiteSparkQwen:
 
 
 def build_litespark_cpu(
-    model_path=MODEL_PATH, *, threads=4, cache_root=None, verbose=True,
-    gemv_layout="int4", gemv_kernel="prefetch1024",
+    model_path=MODEL_PATH, *, threads=DEFAULT_CPU_THREADS, cache_root=None, verbose=True,
+    gemv_layout="int4", gemv_kernel=DEFAULT_GEMV_KERNEL,
 ):
     """Load this Qwen3 LATTICE checkpoint into a torch-free LiteSpark runtime."""
     if gemv_layout not in ("int4", "int8"):
@@ -701,7 +730,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--raw-prompt", action="store_true")
-    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--threads", type=int, default=DEFAULT_CPU_THREADS)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--warmup-tokens", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -720,8 +749,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--gemv-kernel",
         choices=("none", "prefetch256", "prefetch512", "prefetch1024"),
-        default="prefetch1024",
-        help="packed-int4 prefetch variant (default: prefetch1024)",
+        default=DEFAULT_GEMV_KERNEL,
+        help=f"packed-int4 prefetch variant (default: {DEFAULT_GEMV_KERNEL})",
     )
     parser.add_argument(
         "--profile-token", action="store_true",
@@ -848,10 +877,10 @@ def main(argv=None) -> int:
             break
         started = time.perf_counter()
         logits = model.forward_token(token, state)
+        token = sample_logits(logits, generated, args, generator)
         elapsed = time.perf_counter() - started
         if len(generated) > args.warmup_tokens:
             decode_times.append(elapsed)
-        token = sample_logits(logits, generated, args, generator)
 
     print("\n--------------")
     print(f"runtime: litespark cpu ({platform.machine()})")

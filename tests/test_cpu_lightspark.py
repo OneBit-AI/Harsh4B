@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 
 from cpu_lightspark import (
+    DEFAULT_CPU_THREADS,
+    DEFAULT_GEMV_KERNEL,
     MODEL_PATH,
     _pack_int4,
     _pack_ternary,
@@ -20,7 +22,7 @@ from cpu_lightspark import (
 def test_lightspark_cli_defaults_to_local_lattice_configuration():
     args = parse_args(["--prompt", "hello"])
     assert args.model == MODEL_PATH
-    assert args.threads == 4
+    assert args.threads == DEFAULT_CPU_THREADS
     assert args.warmup_tokens == 8
     assert args.temperature == 0.7
     assert args.top_k == 40
@@ -28,7 +30,7 @@ def test_lightspark_cli_defaults_to_local_lattice_configuration():
     assert args.repetition_penalty == 1.08
     assert not args.argmax
     assert args.gemv_layout == "int4"
-    assert args.gemv_kernel == "prefetch1024"
+    assert args.gemv_kernel == DEFAULT_GEMV_KERNEL
 
 
 def test_lightspark_argmax_is_an_explicit_sampling_override():
@@ -71,7 +73,10 @@ def test_native_int4_sdot_matches_integer_reference():
     # PyTorch, whose bundled libomp cannot safely coexist with LiteSpark's.
     script = r'''
 import numpy as np
-from cpu_lightspark import _native_int4_kernel, _native_int8_kernel, _pack_int4
+from cpu_lightspark import (
+    _native_attention_kernel, _native_int4_kernel, _native_int8_kernel,
+    _pack_int4,
+)
 rng = np.random.default_rng(41)
 weights = rng.integers(-7, 8, size=(67, 128), dtype=np.int8)
 activation = rng.integers(-127, 128, size=128, dtype=np.int8)
@@ -92,6 +97,29 @@ assert int8_kernel is not None
 int8_kernel(activation.ctypes.data, weights.ctypes.data, scales.ctypes.data,
             activation_scale, output.ctypes.data, weights.shape[0], weights.shape[1])
 np.testing.assert_allclose(output, expected, rtol=2e-6, atol=2e-5)
+
+attention = _native_attention_kernel()
+assert attention is not None
+kv_heads, groups, context, capacity, head_dim = 2, 3, 7, 11, 16
+query = rng.standard_normal((kv_heads * groups, head_dim), dtype=np.float32)
+keys = rng.standard_normal((capacity, kv_heads, head_dim), dtype=np.float32)
+values = rng.standard_normal((capacity, kv_heads, head_dim), dtype=np.float32)
+scores = np.empty((kv_heads, groups, capacity), dtype=np.float32)
+attended = np.empty_like(query)
+attention(query.ctypes.data, keys.ctypes.data, values.ctypes.data,
+          scores.ctypes.data, attended.ctypes.data, context, kv_heads, groups,
+          head_dim, capacity)
+reference_scores = np.einsum(
+    "hgd,thd->hgt", query.reshape(kv_heads, groups, head_dim), keys[:context],
+    dtype=np.float32,
+) / np.sqrt(np.float32(head_dim))
+reference_scores -= reference_scores.max(axis=-1, keepdims=True)
+reference_scores = np.exp(reference_scores)
+reference_scores /= reference_scores.sum(axis=-1, keepdims=True)
+reference = np.einsum(
+    "hgt,thd->hgd", reference_scores, values[:context], dtype=np.float32,
+).reshape(kv_heads * groups, head_dim)
+np.testing.assert_allclose(attended, reference, rtol=2e-5, atol=2e-5)
 '''
     environment = dict(os.environ, OMP_NUM_THREADS="2")
     subprocess.run([sys.executable, "-B", "-c", script], check=True, env=environment)

@@ -38,6 +38,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
+from cpu_lightspark import DEFAULT_CPU_THREADS  # noqa: E402
+
 IDLE_DEFAULT_S = 3.0
 POLL_INTERVAL_S = 0.1
 
@@ -340,7 +342,7 @@ def parse_args():
                                  "battery", "none"],
                         help="energy backend (default: auto)")
     parser.add_argument("--idle-seconds", type=float, default=IDLE_DEFAULT_S)
-    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument("--cpu-threads", type=int, default=DEFAULT_CPU_THREADS)
     parser.add_argument("--json-out", type=Path, default=None)
     return parser.parse_args()
 

@@ -14,7 +14,7 @@ if [[ ! -x "$python" ]]; then
 fi
 
 exec "$python" -B "$repo_dir/cpu_lightspark.py" \
-  --threads 8 \
+  --threads 6 \
   --prompt "$*" \
   --max-new-tokens 256 \
   --warmup-tokens 6

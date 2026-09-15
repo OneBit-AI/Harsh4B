@@ -18,7 +18,7 @@
 #   REPEATS          repeats per cell/run       (default: 3)
 #   WARMUP           untimed warmup runs        (default: 1)
 #   ENERGY_TOKENS    --max-new-tokens for energy runs (default: 64)
-#   CPU_THREADS      threads for the cpu runtime (default: 4)
+#   CPU_THREADS      threads for the cpu runtime (default: 6 on Apple M4)
 #   RESULTS_DIR      output dir (default: results)
 set -uo pipefail
 
@@ -36,7 +36,7 @@ DECODE_LENS="${DECODE_LENS:-32}"
 REPEATS="${REPEATS:-3}"
 WARMUP="${WARMUP:-1}"
 ENERGY_TOKENS="${ENERGY_TOKENS:-64}"
-CPU_THREADS="${CPU_THREADS:-4}"
+CPU_THREADS="${CPU_THREADS:-6}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 
 echo "== benchmark suite =="

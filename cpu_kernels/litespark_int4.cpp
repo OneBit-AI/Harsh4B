@@ -3,6 +3,9 @@
 // in registers inside the dot-product loop.
 
 #include <arm_neon.h>
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -146,5 +149,111 @@ extern "C" void litespark_int8_i8_gemv(
         }
         output[row_index] = static_cast<float>(scalar)
             * activation_scale * weight_scales[row_index];
+    }
+}
+
+// Single-token grouped-query attention.  NumPy's two einsum dispatches and
+// several temporary ufunc passes cost more than the arithmetic at decode
+// lengths, so keep the complete score/softmax/value operation in one native
+// call.  Keys and values use [time, kv_head, head_dim] layout; query/output
+// heads are ordered [kv_head, group, head_dim].
+extern "C" void litespark_gqa_decode(
+    const float* __restrict__ query,
+    const float* __restrict__ keys,
+    const float* __restrict__ values,
+    float* __restrict__ scores,
+    float* __restrict__ output,
+    int context,
+    int kv_heads,
+    int groups,
+    int head_dim,
+    int score_stride
+) {
+    const int query_heads = kv_heads * groups;
+    const int kv_time_stride = kv_heads * head_dim;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+#pragma omp parallel for if(query_heads >= 8) schedule(static)
+    for (int query_head = 0; query_head < query_heads; ++query_head) {
+        const int kv_head = query_head / groups;
+        const float* q = query
+            + static_cast<ptrdiff_t>(query_head) * head_dim;
+        float* score = scores
+            + static_cast<ptrdiff_t>(query_head) * score_stride;
+        float maximum = -FLT_MAX;
+
+        for (int token = 0; token < context; ++token) {
+            const float* key = keys
+                + static_cast<ptrdiff_t>(token) * kv_time_stride
+                + static_cast<ptrdiff_t>(kv_head) * head_dim;
+            float32x4_t sum0 = vdupq_n_f32(0.0f);
+            float32x4_t sum1 = vdupq_n_f32(0.0f);
+            float32x4_t sum2 = vdupq_n_f32(0.0f);
+            float32x4_t sum3 = vdupq_n_f32(0.0f);
+            int dim = 0;
+            for (; dim + 16 <= head_dim; dim += 16) {
+                sum0 = vfmaq_f32(sum0, vld1q_f32(q + dim),
+                                 vld1q_f32(key + dim));
+                sum1 = vfmaq_f32(sum1, vld1q_f32(q + dim + 4),
+                                 vld1q_f32(key + dim + 4));
+                sum2 = vfmaq_f32(sum2, vld1q_f32(q + dim + 8),
+                                 vld1q_f32(key + dim + 8));
+                sum3 = vfmaq_f32(sum3, vld1q_f32(q + dim + 12),
+                                 vld1q_f32(key + dim + 12));
+            }
+            sum0 = vaddq_f32(sum0, sum1);
+            sum2 = vaddq_f32(sum2, sum3);
+            float dot = vaddvq_f32(vaddq_f32(sum0, sum2));
+            for (; dim < head_dim; ++dim) {
+                dot += q[dim] * key[dim];
+            }
+            score[token] = dot * scale;
+            maximum = std::max(maximum, score[token]);
+        }
+
+        float denominator = 0.0f;
+        for (int token = 0; token < context; ++token) {
+            const float probability = std::exp(score[token] - maximum);
+            score[token] = probability;
+            denominator += probability;
+        }
+        const float inverse_denominator = 1.0f / denominator;
+        for (int token = 0; token < context; ++token) {
+            score[token] *= inverse_denominator;
+        }
+
+        float* attended = output
+            + static_cast<ptrdiff_t>(query_head) * head_dim;
+        int dim = 0;
+        for (; dim + 16 <= head_dim; dim += 16) {
+            float32x4_t sum0 = vdupq_n_f32(0.0f);
+            float32x4_t sum1 = vdupq_n_f32(0.0f);
+            float32x4_t sum2 = vdupq_n_f32(0.0f);
+            float32x4_t sum3 = vdupq_n_f32(0.0f);
+            for (int token = 0; token < context; ++token) {
+                const float* value = values
+                    + static_cast<ptrdiff_t>(token) * kv_time_stride
+                    + static_cast<ptrdiff_t>(kv_head) * head_dim + dim;
+                const float probability = score[token];
+                sum0 = vfmaq_n_f32(sum0, vld1q_f32(value), probability);
+                sum1 = vfmaq_n_f32(sum1, vld1q_f32(value + 4), probability);
+                sum2 = vfmaq_n_f32(sum2, vld1q_f32(value + 8), probability);
+                sum3 = vfmaq_n_f32(sum3, vld1q_f32(value + 12), probability);
+            }
+            vst1q_f32(attended + dim, sum0);
+            vst1q_f32(attended + dim + 4, sum1);
+            vst1q_f32(attended + dim + 8, sum2);
+            vst1q_f32(attended + dim + 12, sum3);
+        }
+        for (; dim < head_dim; ++dim) {
+            float sum = 0.0f;
+            for (int token = 0; token < context; ++token) {
+                const float* value = values
+                    + static_cast<ptrdiff_t>(token) * kv_time_stride
+                    + static_cast<ptrdiff_t>(kv_head) * head_dim;
+                sum += score[token] * value[dim];
+            }
+            attended[dim] = sum;
+        }
     }
 }

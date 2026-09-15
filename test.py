@@ -19,6 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
+from cpu_lightspark import DEFAULT_CPU_THREADS
+
 HERE = Path(__file__).resolve().parent
 MODEL_PATH = HERE / "model.lat.pt"
 TOKENIZER_PATH = HERE / "tokenizer.json"
@@ -67,7 +69,7 @@ def parse_args():
                         help="Profile one warmed MLX decode token by operation category")
     parser.add_argument("--compact-t1", action="store_true",
                         help="Use checkpoint-native compact T1 to reduce memory at lower decode speed")
-    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument("--cpu-threads", type=int, default=DEFAULT_CPU_THREADS)
     parser.add_argument("--cpu-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--cpu-layout", choices=("auto", "packed", "absorbed"), default="auto",
                         help=argparse.SUPPRESS)

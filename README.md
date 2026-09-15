@@ -56,7 +56,7 @@ To control the run directly:
 ```bash
 .venv/bin/python -B cpu_lightspark.py \
   --prompt "Explain why water is cohesive" \
-  --threads 8 \
+  --threads 6 \
   --max-new-tokens 64
 ```
 
@@ -75,7 +75,7 @@ decoding, use `--argmax`:
 ```bash
 .venv/bin/python -B cpu_lightspark.py \
   --prompt "Explain ternary inference" \
-  --threads 8 \
+  --threads 6 \
   --argmax
 ```
 
@@ -90,7 +90,7 @@ This profiles one real decode token after warmup:
 ```bash
 .venv/bin/python -B cpu_lightspark.py \
   --prompt "Explain why water is cohesive" \
-  --threads 8 \
+  --threads 6 \
   --warmup-tokens 8 \
   --profile-token
 ```
@@ -99,18 +99,21 @@ The profiler reports time spent in body GEMV, activation quantization,
 embedding/LM head, attention, RMSNorm, sampling, packing, and other work. It
 also checks the expected call counts for all 36 layers.
 
-One Apple M4 run at context position 49 measured:
+One Apple M4 run at context position 58 measured:
 
 | Work | Time | Decode share |
 | --- | ---: | ---: |
-| Packed int4 GEMV | 23.814 ms | 68.6% |
-| Attention | 3.428 ms | 9.9% |
-| Embedding and LM head | 2.297 ms | 6.6% |
-| RMSNorm | 1.255 ms | 3.6% |
-| Activation quantization | 0.887 ms | 2.6% |
-| Sampling | 0.413 ms | 1.2% |
+| Packed int4 GEMV | 19.306 ms | 70.2% |
+| Attention | 0.978 ms | 3.6% |
+| Embedding and LM head | 1.961 ms | 7.1% |
+| RMSNorm | 1.049 ms | 3.8% |
+| Activation quantization | 0.592 ms | 2.2% |
+| Sampling | 1.916 ms | 7.0% |
 | Standalone packing/depacking | 0 ms | 0% |
-| Other and profiler overhead | 2.600 ms | 7.5% |
+| Other and profiler overhead | 1.708 ms | 6.2% |
+| **Total** | **27.511 ms** | **100%** |
+
+That instrumented token corresponds to **36.35 tok/s**.
 
 Packing is not a separate weight pass. The kernel unpacks signed int4 nibbles
 inside NEON registers immediately before `SDOT`; embedding-row unpacking is
@@ -133,27 +136,31 @@ packed kernel but doubled body-weight traffic and was much slower:
 | Packed int4, 512-byte prefetch | 27.28–27.55 tok/s |
 | Packed int4, 1024-byte prefetch | **28.61–28.84 tok/s** |
 
-Packed int4 was 1.71× faster than expanded int8. Moving prefetch from 512 to
-1024 packed bytes improved full-model decode by 3.8–5.7%, so packed int4 with
-1024-byte prefetch is the default.
+Packed int4 was 1.71× faster than expanded int8. A fresh full-runtime sweep on
+the 10-core Apple M4 found six OpenMP workers and a 512-byte prefetch distance
+to be fastest. Fusing grouped-query score, softmax, and value accumulation in
+the native ARM library then raised three 256-token decode trials to
+**33.17–35.02 tok/s**, including greedy sampling. A 256-token run with the
+default stochastic sampler measured **33.65 tok/s**. These settings are now the
+CPU defaults.
 
 The slower controls remain available for repeatable A/B tests:
 
 ```bash
 # Prefetch-distance test
 .venv/bin/python -B cpu_lightspark.py \
-  --prompt "Explain ternary inference" --threads 8 --argmax \
-  --gemv-kernel prefetch512
+  --prompt "Explain ternary inference" --threads 6 --argmax \
+  --gemv-kernel prefetch1024
 
 # Packed int4 versus expanded int8
 .venv/bin/python -B cpu_lightspark.py \
-  --prompt "Explain ternary inference" --threads 8 --argmax \
+  --prompt "Explain ternary inference" --threads 6 --argmax \
   --gemv-layout int8
 ```
 
 Available packed-kernel choices are `none`, `prefetch256`, `prefetch512`, and
-`prefetch1024`. Use `--argmax` for kernel comparisons so sampling cannot change
-the token path.
+`prefetch1024`; `prefetch512` is the default. Use `--argmax` for kernel
+comparisons so sampling cannot change the token path.
 
 ## Other runtimes
 
@@ -200,11 +207,11 @@ Useful smaller runs:
 ```bash
 # CPU TTFT and per-token latency
 .venv/bin/python -B benchmarks/bench_latency.py \
-  --runtime cpu --cpu-threads 8
+  --runtime cpu --cpu-threads 6
 
 # CPU timing plus energy when a power source is available
 .venv/bin/python -B benchmarks/bench_energy.py \
-  --runtime cpu --cpu-threads 8 \
+  --runtime cpu --cpu-threads 6 \
   --prompt-tokens 128 --max-new-tokens 64
 ```
 

@@ -6,6 +6,8 @@ import platform
 import time
 from pathlib import Path
 
+from cpu_lightspark import DEFAULT_CPU_THREADS
+
 ROOT = Path(__file__).resolve().parent
 MODEL_ID = "Qwen/Qwen3-4B"
 GRAPH_BUCKETS = (512, 1024, 2048)
@@ -165,7 +167,7 @@ class LiteSparkRuntime(Runtime):
     device = "cpu"
     description = "CPU · LiteSpark packed int4 SIMD"
 
-    def __init__(self, path, tokenizer, cpu_threads=4, **_):
+    def __init__(self, path, tokenizer, cpu_threads=DEFAULT_CPU_THREADS, **_):
         import numpy as np
         from cpu_lightspark import build_litespark_cpu
         self.np, self.tokenizer = np, tokenizer
